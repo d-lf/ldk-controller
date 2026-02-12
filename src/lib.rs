@@ -1,4 +1,8 @@
 use nostr_sdk::prelude::*;
+use nostr_sdk::nips::nip04;
+use nostr_sdk::nips::nip47::{
+    ErrorCode, GetInfoResponse, Method, NIP47Error, Request, Response, ResponseResult,
+};
 
 /// Connects to a nostr relay, subscribes to text notes, and responds
 /// "Hi" to any message containing "hello".
@@ -50,4 +54,110 @@ pub async fn run_client(keys: Keys, relay_url: &str) -> Result<Client> {
     });
 
     Ok(client)
+}
+
+/// Methods this wallet currently supports.
+const SUPPORTED_METHODS: &[Method] = &[Method::GetInfo, Method::GetBalance];
+
+/// Starts a NWC (Nostr Wallet Connect) service that listens for NIP-47
+/// requests and responds to them.
+///
+/// On startup, publishes a Kind 13194 (WalletConnectInfo) event advertising
+/// supported methods. Then listens for Kind 23194 requests and responds.
+///
+/// Currently handles `get_info` requests with stub data. Other request
+/// types receive a `NotImplemented` error response.
+pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
+    let client = Client::new(keys.clone());
+    client.add_relay(relay_url).await?;
+    client.connect().await;
+
+    // Publish capabilities (Kind 13194) — space-separated list of supported methods
+    let methods_str: String = SUPPORTED_METHODS
+        .iter()
+        .map(|m| m.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let info_event = EventBuilder::new(Kind::WalletConnectInfo, methods_str);
+    client.send_event_builder(info_event).await?;
+
+    let our_pubkey = keys.public_key();
+
+    // Subscribe to NWC requests addressed to us (p-tagged with our pubkey)
+    let filter = Filter::new()
+        .kind(Kind::WalletConnectRequest)
+        .pubkey(our_pubkey);
+    client.subscribe(filter, None).await?;
+
+    let client_clone = client.clone();
+
+    tokio::spawn(async move {
+        let _ = client_clone
+            .handle_notifications(|notification| async {
+                if let RelayPoolNotification::Event { event, .. } = notification {
+                    if event.kind == Kind::WalletConnectRequest {
+                        if let Err(e) =
+                            handle_nwc_request(&client_clone, &keys, &event).await
+                        {
+                            eprintln!("Failed to handle NWC request: {}", e);
+                        }
+                    }
+                }
+                Ok(false)
+            })
+            .await;
+    });
+
+    Ok(client)
+}
+
+async fn handle_nwc_request(
+    client: &Client,
+    keys: &Keys,
+    event: &Event,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sender_pubkey = event.pubkey;
+
+    // Decrypt the NIP-04 encrypted request content
+    let decrypted = nip04::decrypt(keys.secret_key(), &sender_pubkey, &event.content)?;
+
+    let request = Request::from_json(&decrypted)?;
+
+    let response = match request.method {
+        Method::GetInfo => Response {
+            result_type: Method::GetInfo,
+            error: None,
+            result: Some(ResponseResult::GetInfo(GetInfoResponse {
+                alias: Some("ldk-controller".to_string()),
+                color: None,
+                pubkey: Some(keys.public_key().to_string()),
+                network: Some("regtest".to_string()),
+                block_height: Some(0),
+                block_hash: None,
+                methods: SUPPORTED_METHODS.to_vec(),
+                notifications: vec![],
+            })),
+        },
+        other => Response {
+            result_type: other,
+            error: Some(NIP47Error {
+                code: ErrorCode::NotImplemented,
+                message: format!("{} not implemented yet", other.as_str()),
+            }),
+            result: None,
+        },
+    };
+
+    // Encrypt the response for the sender
+    let response_json = response.as_json();
+    let encrypted = nip04::encrypt(keys.secret_key(), &sender_pubkey, response_json)?;
+
+    // Build and send the response event (Kind 23195)
+    let response_event = EventBuilder::new(Kind::WalletConnectResponse, encrypted)
+        .tag(Tag::public_key(sender_pubkey))
+        .tag(Tag::event(event.id));
+
+    client.send_event_builder(response_event).await?;
+
+    Ok(())
 }
