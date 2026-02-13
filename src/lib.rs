@@ -6,7 +6,7 @@ use nwc::nostr::nips::nip47::{
     CancelHoldInvoiceResponse, ErrorCode, GetBalanceResponse, GetInfoResponse,
     LookupInvoiceResponse, MakeHoldInvoiceResponse, MakeInvoiceResponse, Method, NIP47Error,
     PayInvoiceResponse, PayKeysendResponse, Request, RequestParams, Response, ResponseResult,
-    TransactionState, TransactionType,
+    SettleHoldInvoiceResponse, TransactionState, TransactionType,
 };
 
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
@@ -80,6 +80,7 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::ListTransactions,
     Method::MakeHoldInvoice,
     Method::CancelHoldInvoice,
+    Method::SettleHoldInvoice,
 ];
 
 /// Starts a NWC (Nostr Wallet Connect) service that listens for NIP-47
@@ -506,6 +507,35 @@ impl Handler for CancelHoldInvoiceHandler {
     }
 }
 
+struct SettleHoldInvoiceHandler;
+
+impl Handler for SettleHoldInvoiceHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::SettleHoldInvoice(params) = &req.params {
+            if params.preimage.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "preimage is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for settle_hold_invoice".to_string(),
+        })
+    }
+
+    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+        Ok(Response {
+            result_type: Method::SettleHoldInvoice,
+            error: None,
+            result: Some(ResponseResult::SettleHoldInvoice(SettleHoldInvoiceResponse {})),
+        })
+    }
+}
+
 // Lazily initialize a static handler map to avoid rebuilding it per request.
 fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
     static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
@@ -523,6 +553,7 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
         handlers.insert(Method::ListTransactions, Box::new(ListTransactionsHandler));
         handlers.insert(Method::MakeHoldInvoice, Box::new(MakeHoldInvoiceHandler));
         handlers.insert(Method::CancelHoldInvoice, Box::new(CancelHoldInvoiceHandler));
+        handlers.insert(Method::SettleHoldInvoice, Box::new(SettleHoldInvoiceHandler));
         handlers
     })
 }
