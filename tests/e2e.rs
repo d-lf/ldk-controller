@@ -5,6 +5,7 @@ use nwc::nostr::nips::nip47::{
     Request, RequestParams, Response, ResponseResult, SettleHoldInvoiceRequest,
 };
 use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -35,6 +36,14 @@ async fn start_relay() -> (testcontainers::ContainerAsync<GenericImage>, String)
     (container, relay_url)
 }
 
+fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("test lock poisoned")
+}
+
 /// End-to-end test: send "hello", expect the app to respond with "Hi".
 ///
 /// Uses a fresh strfry container so there are no leftover events.
@@ -46,6 +55,7 @@ async fn start_relay() -> (testcontainers::ContainerAsync<GenericImage>, String)
 /// 6. Sender receives "Hi" — test passes
 #[tokio::test]
 async fn test_hello_gets_hi_response() -> Result<()> {
+    let _guard = test_guard();
     // Start a fresh relay — no leftover events from previous runs
     let (_container, relay_url) = start_relay().await;
 
@@ -112,6 +122,7 @@ async fn test_hello_gets_hi_response() -> Result<()> {
 /// 6. Client decrypts and validates the get_info response
 #[tokio::test]
 async fn test_nwc_get_info_roundtrip() -> Result<()> {
+    let _guard = test_guard();
     let (_container, relay_url) = start_relay().await;
 
     // Wallet service keys — the NWC service we're testing
@@ -218,6 +229,7 @@ async fn test_nwc_get_info_roundtrip() -> Result<()> {
 /// End-to-end test: send a NWC get_balance request, expect a valid response.
 #[tokio::test]
 async fn test_nwc_get_balance_roundtrip() -> Result<()> {
+    let _guard = test_guard();
     let (_container, relay_url) = start_relay().await;
 
     let service_keys = Keys::generate();
@@ -292,6 +304,7 @@ async fn test_nwc_get_balance_roundtrip() -> Result<()> {
 /// End-to-end test: send a NWC pay_invoice request, expect a valid response.
 #[tokio::test]
 async fn test_nwc_pay_invoice_roundtrip() -> Result<()> {
+    let _guard = test_guard();
     let (_container, relay_url) = start_relay().await;
 
     let service_keys = Keys::generate();
@@ -368,6 +381,7 @@ async fn test_nwc_pay_invoice_roundtrip() -> Result<()> {
 /// End-to-end test: send a NWC pay_keysend request, expect a valid response.
 #[tokio::test]
 async fn test_nwc_pay_keysend_roundtrip() -> Result<()> {
+    let _guard = test_guard();
     let (_container, relay_url) = start_relay().await;
 
     let service_keys = Keys::generate();
@@ -451,6 +465,7 @@ async fn test_nwc_pay_keysend_roundtrip() -> Result<()> {
 /// End-to-end test: send a NWC make_invoice request, expect a valid response.
 #[tokio::test]
 async fn test_nwc_make_invoice_roundtrip() -> Result<()> {
+    let _guard = test_guard();
     let (_container, relay_url) = start_relay().await;
 
     let service_keys = Keys::generate();
@@ -531,6 +546,7 @@ async fn test_nwc_make_invoice_roundtrip() -> Result<()> {
 /// End-to-end test: send a NWC lookup_invoice request, expect a valid response.
 #[tokio::test]
 async fn test_nwc_lookup_invoice_roundtrip() -> Result<()> {
+    let _guard = test_guard();
     let (_container, relay_url) = start_relay().await;
 
     let service_keys = Keys::generate();
@@ -609,6 +625,7 @@ async fn test_nwc_lookup_invoice_roundtrip() -> Result<()> {
 /// End-to-end test: send a NWC list_transactions request, expect a valid response.
 #[tokio::test]
 async fn test_nwc_list_transactions_roundtrip() -> Result<()> {
+    let _guard = test_guard();
     let (_container, relay_url) = start_relay().await;
 
     let service_keys = Keys::generate();
@@ -684,6 +701,7 @@ async fn test_nwc_list_transactions_roundtrip() -> Result<()> {
 /// End-to-end test: send a NWC make_hold_invoice request, expect a valid response.
 #[tokio::test]
 async fn test_nwc_make_hold_invoice_roundtrip() -> Result<()> {
+    let _guard = test_guard();
     let (_container, relay_url) = start_relay().await;
 
     let service_keys = Keys::generate();
@@ -770,6 +788,7 @@ async fn test_nwc_make_hold_invoice_roundtrip() -> Result<()> {
 /// End-to-end test: send a NWC cancel_hold_invoice request, expect a valid response.
 #[tokio::test]
 async fn test_nwc_cancel_hold_invoice_roundtrip() -> Result<()> {
+    let _guard = test_guard();
     let (_container, relay_url) = start_relay().await;
 
     let service_keys = Keys::generate();
@@ -849,6 +868,7 @@ async fn test_nwc_cancel_hold_invoice_roundtrip() -> Result<()> {
 /// End-to-end test: send a NWC settle_hold_invoice request, expect a valid response.
 #[tokio::test]
 async fn test_nwc_settle_hold_invoice_roundtrip() -> Result<()> {
+    let _guard = test_guard();
     let (_container, relay_url) = start_relay().await;
 
     let service_keys = Keys::generate();

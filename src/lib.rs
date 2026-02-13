@@ -10,7 +10,7 @@ use nwc::nostr::nips::nip47::{
 };
 
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
-static OWNERS: OnceLock<Vec<String>> = OnceLock::new();
+static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 #[derive(Debug, Clone)]
 struct AccessRule {
     rate: u64,
@@ -23,11 +23,15 @@ fn set_global_keys(keys: &Keys) {
 }
 
 pub fn set_owners(owners: Vec<String>) {
-    let _ = OWNERS.set(owners);
+    let lock = OWNERS.get_or_init(|| RwLock::new(Vec::new()));
+    let mut guard = lock.write().expect("owners lock poisoned");
+    *guard = owners;
 }
 
-pub fn owners() -> &'static [String] {
-    OWNERS.get_or_init(Vec::new)
+fn owners_contains(pubkey: &str) -> bool {
+    let lock = OWNERS.get_or_init(|| RwLock::new(Vec::new()));
+    let guard = lock.read().expect("owners lock poisoned");
+    guard.iter().any(|owner| owner == pubkey)
 }
 
 fn access() -> &'static RwLock<HashMap<String, HashMap<Method, AccessRule>>> {
@@ -38,6 +42,22 @@ pub fn set_access_rule(pubkey: &str, method: Method, rate: u64) {
     let mut map = access().write().expect("access map lock poisoned");
     let entry = map.entry(pubkey.to_string()).or_insert_with(HashMap::new);
     entry.insert(method, AccessRule { rate });
+}
+
+fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
+    let caller_pubkey = event.pubkey.to_string();
+    if owners_contains(&caller_pubkey) {
+        return Ok(());
+    }
+
+    Err(Response {
+        result_type: request.method.clone(),
+        error: Some(NIP47Error {
+            code: ErrorCode::Restricted,
+            message: "access denied, insufficient permission".to_string(),
+        }),
+        result: None,
+    })
 }
 
 /// Connects to a nostr relay, subscribes to text notes, and responds
@@ -518,7 +538,9 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
 async fn process_nwc_request(request: Request, event: &Event) -> Response {
 
     // Check that the user is authorized
-    println!("Here I will checking permissions for {}...", event.pubkey.to_bech32().unwrap_or_default());
+    if let Err(response) = verify_access(&request, event) {
+        return response;
+    }
 
     // Check that we support the requested method
     if ! request_handlers().contains_key(&request.method) {
