@@ -72,9 +72,7 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::GetInfo,
     Method::GetBalance,
     Method::PayInvoice,
-    Method::MultiPayInvoice,
     Method::PayKeysend,
-    Method::MultiPayKeysend,
     Method::MakeInvoice,
     Method::LookupInvoice,
     Method::ListTransactions,
@@ -225,38 +223,6 @@ impl Handler for PayInvoiceHandler {
     }
 }
 
-struct MultiPayInvoiceHandler;
-
-impl Handler for MultiPayInvoiceHandler {
-    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
-        if let RequestParams::MultiPayInvoice(params) = &req.params {
-            if params.invoices.is_empty() {
-                return Err(NIP47Error {
-                    code: ErrorCode::Other,
-                    message: "invoices list is required".to_string(),
-                });
-            }
-            return Ok(());
-        }
-
-        Err(NIP47Error {
-            code: ErrorCode::Other,
-            message: "invalid params for multi_pay_invoice".to_string(),
-        })
-    }
-
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
-        Ok(Response {
-            result_type: Method::MultiPayInvoice,
-            error: None,
-            result: Some(ResponseResult::MultiPayInvoice(PayInvoiceResponse {
-                preimage: "00".to_string(),
-                fees_paid: Some(0),
-            })),
-        })
-    }
-}
-
 struct PayKeysendHandler;
 
 impl Handler for PayKeysendHandler {
@@ -288,38 +254,6 @@ impl Handler for PayKeysendHandler {
             result_type: Method::PayKeysend,
             error: None,
             result: Some(ResponseResult::PayKeysend(PayKeysendResponse {
-                preimage: "00".to_string(),
-                fees_paid: Some(0),
-            })),
-        })
-    }
-}
-
-struct MultiPayKeysendHandler;
-
-impl Handler for MultiPayKeysendHandler {
-    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
-        if let RequestParams::MultiPayKeysend(params) = &req.params {
-            if params.keysends.is_empty() {
-                return Err(NIP47Error {
-                    code: ErrorCode::Other,
-                    message: "keysends list is required".to_string(),
-                });
-            }
-            return Ok(());
-        }
-
-        Err(NIP47Error {
-            code: ErrorCode::Other,
-            message: "invalid params for multi_pay_keysend".to_string(),
-        })
-    }
-
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
-        Ok(Response {
-            result_type: Method::MultiPayKeysend,
-            error: None,
-            result: Some(ResponseResult::MultiPayKeysend(PayKeysendResponse {
                 preimage: "00".to_string(),
                 fees_paid: Some(0),
             })),
@@ -545,9 +479,7 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
         handlers.insert(Method::GetInfo, Box::new(GetInfoHandler));
         handlers.insert(Method::GetBalance, Box::new(GetBalanceHandler));
         handlers.insert(Method::PayInvoice, Box::new(PayInvoiceHandler));
-        handlers.insert(Method::MultiPayInvoice, Box::new(MultiPayInvoiceHandler));
         handlers.insert(Method::PayKeysend, Box::new(PayKeysendHandler));
-        handlers.insert(Method::MultiPayKeysend, Box::new(MultiPayKeysendHandler));
         handlers.insert(Method::MakeInvoice, Box::new(MakeInvoiceHandler));
         handlers.insert(Method::LookupInvoice, Box::new(LookupInvoiceHandler));
         handlers.insert(Method::ListTransactions, Box::new(ListTransactionsHandler));
