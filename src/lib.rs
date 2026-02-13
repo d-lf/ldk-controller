@@ -3,8 +3,8 @@ use std::sync::OnceLock;
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
-    ErrorCode, GetBalanceResponse, GetInfoResponse, Method, NIP47Error, Request, RequestParams,
-    Response, ResponseResult,
+    ErrorCode, GetBalanceResponse, GetInfoResponse, Method, NIP47Error, PayInvoiceResponse, Request,
+    RequestParams, Response, ResponseResult,
 };
 
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
@@ -178,6 +178,38 @@ impl Handler for GetBalanceHandler {
     }
 }
 
+struct PayInvoiceHandler;
+
+impl Handler for PayInvoiceHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::PayInvoice(params) = &req.params {
+            if params.invoice.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "invoice is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for pay_invoice".to_string(),
+        })
+    }
+
+    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+        Ok(Response {
+            result_type: Method::PayInvoice,
+            error: None,
+            result: Some(ResponseResult::PayInvoice(PayInvoiceResponse {
+                preimage: "00".to_string(),
+                fees_paid: Some(0),
+            })),
+        })
+    }
+}
+
 // Lazily initialize a static handler map to avoid rebuilding it per request.
 fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
     static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
@@ -186,6 +218,7 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
         let mut handlers: HashMap<Method, Box<dyn Handler + Send + Sync>> = HashMap::new();
         handlers.insert(Method::GetInfo, Box::new(GetInfoHandler));
         handlers.insert(Method::GetBalance, Box::new(GetBalanceHandler));
+        handlers.insert(Method::PayInvoice, Box::new(PayInvoiceHandler));
         handlers
     })
 }

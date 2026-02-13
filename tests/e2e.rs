@@ -1,5 +1,5 @@
 use nostr_sdk::prelude::*;
-use nwc::nostr::nips::nip47::{NostrWalletConnectUri, Request, Response};
+use nwc::nostr::nips::nip47::{NostrWalletConnectUri, PayInvoiceRequest, Request, Response};
 use std::time::Duration;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -274,6 +274,79 @@ async fn test_nwc_get_balance_roundtrip() -> Result<()> {
     match result {
         Ok(Ok(())) => {
             println!("NWC get_balance roundtrip test passed!");
+            Ok(())
+        }
+        Ok(Err(e)) => panic!("Notification handler error: {}", e),
+        Err(_) => panic!("Timeout: did not receive NWC response within 10 seconds"),
+    }
+}
+
+/// End-to-end test: send a NWC pay_invoice request, expect a valid response.
+#[tokio::test]
+async fn test_nwc_pay_invoice_roundtrip() -> Result<()> {
+    let (_container, relay_url) = start_relay().await;
+
+    let service_keys = Keys::generate();
+    let service_pubkey = service_keys.public_key();
+    let _service_client =
+        ldk_controller::run_nwc_service(service_keys, &relay_url).await?;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let client_secret = Keys::generate().secret_key().clone();
+    let relay = RelayUrl::parse(&relay_url)?;
+    let uri = NostrWalletConnectUri::new(
+        service_pubkey,
+        vec![relay],
+        client_secret.clone(),
+        None,
+    );
+
+    let client_keys = Keys::new(client_secret);
+    let nwc_client = Client::builder().signer(client_keys).build();
+    nwc_client.add_relay(&relay_url).await?;
+    nwc_client.connect().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let filter = Filter::new()
+        .kind(Kind::WalletConnectResponse)
+        .author(service_pubkey);
+    nwc_client.subscribe(filter).await?;
+
+    let request_event = Request::pay_invoice(PayInvoiceRequest::new("dummy_invoice"))
+        .to_event(&uri)
+        .expect("Failed to create NWC request event");
+    nwc_client.send_event(&request_event).await?;
+    println!("Sent NWC pay_invoice request, waiting for response...");
+
+    let timeout = Duration::from_secs(10);
+    let uri_clone = uri.clone();
+    let result = tokio::time::timeout(timeout, async {
+        let mut notifications = nwc_client.notifications();
+        while let Some(notification) = notifications.next().await {
+            if let ClientNotification::Event { event, .. } = notification {
+                let event = event.as_ref();
+                if event.kind == Kind::WalletConnectResponse && event.pubkey == service_pubkey {
+                    let response = Response::from_event(&uri_clone, event)
+                        .expect("Failed to decrypt NWC response");
+
+                    let pay = response
+                        .to_pay_invoice()
+                        .expect("Response was not a valid pay_invoice");
+
+                    assert_eq!(pay.preimage, "00");
+                    assert_eq!(pay.fees_paid, Some(0));
+                    break;
+                }
+            }
+        }
+        Ok::<(), nostr_sdk::client::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            println!("NWC pay_invoice roundtrip test passed!");
             Ok(())
         }
         Ok(Err(e)) => panic!("Notification handler error: {}", e),
