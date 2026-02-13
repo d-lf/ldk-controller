@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
@@ -9,6 +6,9 @@ use nwc::nostr::nips::nip47::{
     PayInvoiceResponse, PayKeysendResponse, Request, RequestParams, Response, ResponseResult,
     SettleHoldInvoiceResponse, TransactionState, TransactionType,
 };
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
 static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
@@ -86,7 +86,7 @@ pub fn set_quota(pubkey: &str, refill_per_micro: u64, capacity_msat: u64) {
 
 fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     let caller_pubkey = event.pubkey.to_string();
-    
+
     // Owners bypass all access checks.
     if owners_contains(&caller_pubkey) {
         return Ok(());
@@ -98,7 +98,7 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     let methods = access_map
         .get_mut(&caller_pubkey)
         .ok_or_else(|| access_denied_response(&request.method))?;
-    
+
     // Deny when the method has no access rule.
     let rule = methods
         .get_mut(&request.method)
@@ -117,28 +117,33 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     let amount_msat = request_spend_msat(request);
 
     let mut quota_map = quotas().write().expect("quota map lock poisoned");
-    let quota = quota_map.get_mut(&caller_pubkey);
+    // let quota = quota_map.get_mut(&caller_pubkey);
 
-    if amount_msat > 0 {
-        if let Some(quota) = quota {
+    let mut new_balance: Option<u64> = None;
 
-            if quota.refill_per_micro == 0 || quota.capacity_msat == 0 {
-                return Err(quota_exceeded_response(&request.method));
-            }
+    if let Some(amount_msat) = amount_msat {
+        if let Some(quota) = quota_map.get(&caller_pubkey) {
+            // if quota.refill_per_micro == 0 || quota.capacity_msat == 0 {
+            //     return Err(quota_exceeded_response(&request.method));
+            // }
+
+            let mut calc_balance = quota.balance_msat;
 
             let elapsed = now.saturating_sub(quota.last_refill_micros);
 
             if elapsed > 0 {
                 let added = quota.refill_per_micro.saturating_mul(elapsed);
-                let new_balance = quota.balance_msat.saturating_add(added);
-                quota.balance_msat = new_balance.min(quota.capacity_msat);
-                quota.last_refill_micros = now;
+                calc_balance = calc_balance.saturating_add(added).min(quota.capacity_msat);
+                // quota.balance_msat = new_balance.min(quota.capacity_msat);
+                // quota.last_refill_micros = now;
             }
 
-            if quota.balance_msat < amount_msat {
+            if calc_balance < amount_msat {
                 return Err(quota_exceeded_response(&request.method));
             }
-            quota.balance_msat -= amount_msat;
+
+            calc_balance -= amount_msat;
+            new_balance = Some(calc_balance);
         }
     }
 
@@ -146,7 +151,7 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
 
     // Of rate, if rate capped
     let elapsed = now.saturating_sub(rule.last_refill_micros);
-    
+
     if elapsed > 0 {
         let added = rule.refill_per_micro.saturating_mul(elapsed);
         let new_tokens = rule.tokens_micros.saturating_add(added);
@@ -161,8 +166,17 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
 
     // Great we have made it apply the changes
 
+    // Update
     // Consume a token and allow the request.
     rule.tokens_micros -= 1_000_000;
+
+    if let Some(new_balance) = new_balance {
+        if let Some(quota) = quota_map.get_mut(&caller_pubkey) {
+            quota.balance_msat = new_balance;
+            quota.last_refill_micros = now;
+        }
+    }
+
     Ok(())
 }
 
@@ -199,11 +213,11 @@ fn quota_exceeded_response(method: &Method) -> Response {
     }
 }
 
-fn request_spend_msat(request: &Request) -> u64 {
+fn request_spend_msat(request: &Request) -> Option<u64> {
     match &request.params {
-        RequestParams::PayInvoice(params) => params.amount.unwrap_or(0),
-        RequestParams::PayKeysend(params) => params.amount,
-        _ => 0,
+        RequestParams::PayInvoice(params) => params.amount,
+        RequestParams::PayKeysend(params) => Some(params.amount),
+        _ => None,
     }
 }
 
@@ -214,7 +228,6 @@ fn now_micros() -> u64 {
         .as_micros()
         .min(u128::from(u64::MAX)) as u64
 }
-
 
 /// Connects to a nostr relay, subscribes to text notes, and responds
 /// "Hi" to any message containing "hello".
@@ -350,23 +363,21 @@ impl Handler for GetInfoHandler {
         Ok(())
     }
 
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> { 
-        Ok(
-            Response {
-        result_type: Method::GetInfo,
-        error: None,
-        result: Some(ResponseResult::GetInfo(GetInfoResponse {
-            alias: Some("ldk-controller".to_string()),
-            color: None,
-            pubkey: Some(GLOBAL_KEYS.get().unwrap().public_key().to_string()),
-            network: Some("regtest".to_string()),
-            block_height: Some(0),
-            block_hash: None,
-            methods: SUPPORTED_METHODS.to_vec(),
-            notifications: vec![],
-            })
-        ),
-    })    
+    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+        Ok(Response {
+            result_type: Method::GetInfo,
+            error: None,
+            result: Some(ResponseResult::GetInfo(GetInfoResponse {
+                alias: Some("ldk-controller".to_string()),
+                color: None,
+                pubkey: Some(GLOBAL_KEYS.get().unwrap().public_key().to_string()),
+                network: Some("regtest".to_string()),
+                block_height: Some(0),
+                block_hash: None,
+                methods: SUPPORTED_METHODS.to_vec(),
+                notifications: vec![],
+            })),
+        })
     }
 }
 
@@ -387,7 +398,9 @@ impl Handler for GetBalanceHandler {
         Ok(Response {
             result_type: Method::GetBalance,
             error: None,
-            result: Some(ResponseResult::GetBalance(GetBalanceResponse { balance: 0 })),
+            result: Some(ResponseResult::GetBalance(GetBalanceResponse {
+                balance: 0,
+            })),
         })
     }
 }
@@ -637,7 +650,9 @@ impl Handler for CancelHoldInvoiceHandler {
         Ok(Response {
             result_type: Method::CancelHoldInvoice,
             error: None,
-            result: Some(ResponseResult::CancelHoldInvoice(CancelHoldInvoiceResponse {})),
+            result: Some(ResponseResult::CancelHoldInvoice(
+                CancelHoldInvoiceResponse {},
+            )),
         })
     }
 }
@@ -666,7 +681,9 @@ impl Handler for SettleHoldInvoiceHandler {
         Ok(Response {
             result_type: Method::SettleHoldInvoice,
             error: None,
-            result: Some(ResponseResult::SettleHoldInvoice(SettleHoldInvoiceResponse {})),
+            result: Some(ResponseResult::SettleHoldInvoice(
+                SettleHoldInvoiceResponse {},
+            )),
         })
     }
 }
@@ -685,21 +702,26 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
         handlers.insert(Method::LookupInvoice, Box::new(LookupInvoiceHandler));
         handlers.insert(Method::ListTransactions, Box::new(ListTransactionsHandler));
         handlers.insert(Method::MakeHoldInvoice, Box::new(MakeHoldInvoiceHandler));
-        handlers.insert(Method::CancelHoldInvoice, Box::new(CancelHoldInvoiceHandler));
-        handlers.insert(Method::SettleHoldInvoice, Box::new(SettleHoldInvoiceHandler));
+        handlers.insert(
+            Method::CancelHoldInvoice,
+            Box::new(CancelHoldInvoiceHandler),
+        );
+        handlers.insert(
+            Method::SettleHoldInvoice,
+            Box::new(SettleHoldInvoiceHandler),
+        );
         handlers
     })
 }
 
 async fn process_nwc_request(request: Request, event: &Event) -> Response {
-
     // Check that the user is authorized
     if let Err(response) = verify_access(&request, event) {
         return response;
     }
 
     // Check that we support the requested method
-    if ! request_handlers().contains_key(&request.method) {
+    if !request_handlers().contains_key(&request.method) {
         return Response {
             result_type: request.method.clone(),
             error: Some(NIP47Error {
@@ -707,7 +729,7 @@ async fn process_nwc_request(request: Request, event: &Event) -> Response {
                 message: format!("{} not implemented yet", request.method.as_str()),
             }),
             result: None,
-        }
+        };
     }
 
     // Select a handler
@@ -719,7 +741,7 @@ async fn process_nwc_request(request: Request, event: &Event) -> Response {
             result_type: request.method.clone(),
             error: Some(e),
             result: None,
-        }
+        };
     }
 
     // Execute the request
