@@ -3,8 +3,9 @@ use std::sync::OnceLock;
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
-    ErrorCode, GetBalanceResponse, GetInfoResponse, MakeInvoiceResponse, Method, NIP47Error,
-    PayInvoiceResponse, PayKeysendResponse, Request, RequestParams, Response, ResponseResult,
+    ErrorCode, GetBalanceResponse, GetInfoResponse, LookupInvoiceResponse, MakeInvoiceResponse,
+    Method, NIP47Error, PayInvoiceResponse, PayKeysendResponse, Request, RequestParams, Response,
+    ResponseResult, TransactionState, TransactionType,
 };
 
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
@@ -74,6 +75,7 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::PayKeysend,
     Method::MultiPayKeysend,
     Method::MakeInvoice,
+    Method::LookupInvoice,
 ];
 
 /// Starts a NWC (Nostr Wallet Connect) service that listens for NIP-47
@@ -358,6 +360,51 @@ impl Handler for MakeInvoiceHandler {
     }
 }
 
+struct LookupInvoiceHandler;
+
+impl Handler for LookupInvoiceHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::LookupInvoice(params) = &req.params {
+            if params.payment_hash.as_deref().unwrap_or("").is_empty()
+                && params.invoice.as_deref().unwrap_or("").is_empty()
+            {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "payment_hash or invoice is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for lookup_invoice".to_string(),
+        })
+    }
+
+    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+        Ok(Response {
+            result_type: Method::LookupInvoice,
+            error: None,
+            result: Some(ResponseResult::LookupInvoice(LookupInvoiceResponse {
+                transaction_type: Some(TransactionType::Outgoing),
+                state: Some(TransactionState::Settled),
+                invoice: None,
+                description: None,
+                description_hash: None,
+                preimage: None,
+                payment_hash: "00".to_string(),
+                amount: 0,
+                fees_paid: 0,
+                created_at: Timestamp::now(),
+                expires_at: None,
+                settled_at: None,
+                metadata: None,
+            })),
+        })
+    }
+}
+
 // Lazily initialize a static handler map to avoid rebuilding it per request.
 fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
     static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
@@ -371,6 +418,7 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
         handlers.insert(Method::PayKeysend, Box::new(PayKeysendHandler));
         handlers.insert(Method::MultiPayKeysend, Box::new(MultiPayKeysendHandler));
         handlers.insert(Method::MakeInvoice, Box::new(MakeInvoiceHandler));
+        handlers.insert(Method::LookupInvoice, Box::new(LookupInvoiceHandler));
         handlers
     })
 }
