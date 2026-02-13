@@ -1,8 +1,16 @@
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
     ErrorCode, GetInfoResponse, Method, NIP47Error, Request, Response, ResponseResult,
 };
+
+static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
+
+fn set_global_keys(keys: &Keys) {
+    let _ = GLOBAL_KEYS.set(keys.clone());
+}
 
 /// Connects to a nostr relay, subscribes to text notes, and responds
 /// "Hi" to any message containing "hello".
@@ -10,6 +18,7 @@ use nwc::nostr::nips::nip47::{
 /// The `client` is returned by reference so the caller (main or tests)
 /// retains access to it for shutdown or further interaction.
 pub async fn run_client(keys: Keys, relay_url: &str) -> Result<Client> {
+    set_global_keys(&keys);
     let client = Client::builder().signer(keys).build();
     client.add_relay(relay_url).await?;
     println!("Connecting to relay {}...", relay_url);
@@ -67,6 +76,7 @@ const SUPPORTED_METHODS: &[Method] = &[Method::GetInfo, Method::GetBalance];
 /// Currently handles `get_info` requests with stub data. Other request
 /// types receive a `NotImplemented` error response.
 pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
+    set_global_keys(&keys);
     let client = Client::builder().signer(keys.clone()).build();
     client.add_relay(relay_url).await?;
     client.connect().await;
@@ -107,6 +117,82 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
     Ok(client)
 }
 
+trait Handler: Send + Sync {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error>;
+    fn execute(&self, req: &Request) -> Result<Response, NIP47Error>;
+}
+
+struct GetInfoHandler;
+
+impl Handler for GetInfoHandler {
+    fn validate(&self, _req: &Request) -> Result<(), NIP47Error> {
+        Ok(())
+    }
+
+    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> { 
+        Ok(
+            Response {
+        result_type: Method::GetInfo,
+        error: None,
+        result: Some(ResponseResult::GetInfo(GetInfoResponse {
+            alias: Some("ldk-controller".to_string()),
+            color: None,
+            pubkey: Some(GLOBAL_KEYS.get().unwrap().public_key().to_string()),
+            network: Some("regtest".to_string()),
+            block_height: Some(0),
+            block_hash: None,
+            methods: SUPPORTED_METHODS.to_vec(),
+            notifications: vec![],
+            })
+        ),
+    })    
+    }
+}
+
+// Lazily initialize a static handler map to avoid rebuilding it per request.
+fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
+    static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
+
+    HANDLERS.get_or_init(|| {
+        let mut handlers: HashMap<Method, Box<dyn Handler + Send + Sync>> = HashMap::new();
+        handlers.insert(Method::GetInfo, Box::new(GetInfoHandler));
+        handlers
+    })
+}
+
+async fn process_nwc_request(request: Request, event: &Event) -> Response {
+
+    // Check that the user is authorized
+    println!("Here I will checking permissions for {}...", event.pubkey.to_bech32().unwrap_or_default());
+
+    // Check that we support the requested method
+    if ! request_handlers().contains_key(&request.method) {
+        return Response {
+            result_type: request.method.clone(),
+            error: Some(NIP47Error {
+                code: ErrorCode::NotImplemented,
+                message: format!("{} not implemented yet", request.method.as_str()),
+            }),
+            result: None,
+        }
+    }
+
+    // Select a handler
+    let handler = request_handlers().get(&request.method).unwrap();
+
+    // Validate the request
+    if let Err(e) = handler.validate(&request) {
+        return Response {
+            result_type: request.method.clone(),
+            error: Some(e),
+            result: None,
+        }
+    }
+
+    // Execute the request
+    handler.execute(&request).unwrap()
+}
+
 async fn handle_nwc_request(
     client: &Client,
     keys: &Keys,
@@ -119,30 +205,34 @@ async fn handle_nwc_request(
 
     let request = Request::from_json(&decrypted)?;
 
-    let response = match request.method {
-        Method::GetInfo => Response {
-            result_type: Method::GetInfo,
-            error: None,
-            result: Some(ResponseResult::GetInfo(GetInfoResponse {
-                alias: Some("ldk-controller".to_string()),
-                color: None,
-                pubkey: Some(keys.public_key().to_string()),
-                network: Some("regtest".to_string()),
-                block_height: Some(0),
-                block_hash: None,
-                methods: SUPPORTED_METHODS.to_vec(),
-                notifications: vec![],
-            })),
-        },
-        other => Response {
-            result_type: other.clone(),
-            error: Some(NIP47Error {
-                code: ErrorCode::NotImplemented,
-                message: format!("{} not implemented yet", other.as_str()),
-            }),
-            result: None,
-        },
-    };
+    let response = process_nwc_request(request, event).await;
+    //
+    //
+    //
+    // let response = match request.method {
+    //     Method::GetInfo => Response {
+    //         result_type: Method::GetInfo,
+    //         error: None,
+    //         result: Some(ResponseResult::GetInfo(GetInfoResponse {
+    //             alias: Some("ldk-controller".to_string()),
+    //             color: None,
+    //             pubkey: Some(keys.public_key().to_string()),
+    //             network: Some("regtest".to_string()),
+    //             block_height: Some(0),
+    //             block_hash: None,
+    //             methods: SUPPORTED_METHODS.to_vec(),
+    //             notifications: vec![],
+    //         })),
+    //     },
+    //     other => Response {
+    //         result_type: other.clone(),
+    //         error: Some(NIP47Error {
+    //             code: ErrorCode::NotImplemented,
+    //             message: format!("{} not implemented yet", other.as_str()),
+    //         }),
+    //         result: None,
+    //     },
+    // };
 
     // Encrypt the response for the sender
     let response_json = response.as_json();
