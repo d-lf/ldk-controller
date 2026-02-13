@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
@@ -10,9 +10,34 @@ use nwc::nostr::nips::nip47::{
 };
 
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
+static OWNERS: OnceLock<Vec<String>> = OnceLock::new();
+#[derive(Debug, Clone)]
+struct AccessRule {
+    rate: u64,
+}
+
+static ACCESS: OnceLock<RwLock<HashMap<String, HashMap<Method, AccessRule>>>> = OnceLock::new();
 
 fn set_global_keys(keys: &Keys) {
     let _ = GLOBAL_KEYS.set(keys.clone());
+}
+
+pub fn set_owners(owners: Vec<String>) {
+    let _ = OWNERS.set(owners);
+}
+
+pub fn owners() -> &'static [String] {
+    OWNERS.get_or_init(Vec::new)
+}
+
+fn access() -> &'static RwLock<HashMap<String, HashMap<Method, AccessRule>>> {
+    ACCESS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn set_access_rule(pubkey: &str, method: Method, rate: u64) {
+    let mut map = access().write().expect("access map lock poisoned");
+    let entry = map.entry(pubkey.to_string()).or_insert_with(HashMap::new);
+    entry.insert(method, AccessRule { rate });
 }
 
 /// Connects to a nostr relay, subscribes to text notes, and responds

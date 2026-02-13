@@ -156,6 +156,8 @@ async fn test_nwc_get_info_roundtrip() -> Result<()> {
 
     // Create the NWC client — uses keys derived from the shared secret
     let client_keys = Keys::new(client_secret);
+    let client_pubkey = client_keys.public_key().to_string();
+    ldk_controller::set_owners(vec![client_pubkey.clone()]);
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;
     nwc_client.connect().await;
@@ -235,6 +237,8 @@ async fn test_nwc_get_balance_roundtrip() -> Result<()> {
     );
 
     let client_keys = Keys::new(client_secret);
+    let client_pubkey = client_keys.public_key().to_string();
+    ldk_controller::set_owners(vec![client_pubkey.clone()]);
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;
     nwc_client.connect().await;
@@ -307,6 +311,8 @@ async fn test_nwc_pay_invoice_roundtrip() -> Result<()> {
     );
 
     let client_keys = Keys::new(client_secret);
+    let client_pubkey = client_keys.public_key().to_string();
+    ldk_controller::set_owners(vec![client_pubkey.clone()]);
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;
     nwc_client.connect().await;
@@ -381,6 +387,8 @@ async fn test_nwc_pay_keysend_roundtrip() -> Result<()> {
     );
 
     let client_keys = Keys::new(client_secret);
+    let client_pubkey = client_keys.public_key().to_string();
+    ldk_controller::set_owners(vec![client_pubkey.clone()]);
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;
     nwc_client.connect().await;
@@ -462,6 +470,8 @@ async fn test_nwc_make_invoice_roundtrip() -> Result<()> {
     );
 
     let client_keys = Keys::new(client_secret);
+    let client_pubkey = client_keys.public_key().to_string();
+    ldk_controller::set_owners(vec![client_pubkey.clone()]);
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;
     nwc_client.connect().await;
@@ -540,6 +550,8 @@ async fn test_nwc_lookup_invoice_roundtrip() -> Result<()> {
     );
 
     let client_keys = Keys::new(client_secret);
+    let client_pubkey = client_keys.public_key().to_string();
+    ldk_controller::set_owners(vec![client_pubkey.clone()]);
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;
     nwc_client.connect().await;
@@ -616,6 +628,8 @@ async fn test_nwc_list_transactions_roundtrip() -> Result<()> {
     );
 
     let client_keys = Keys::new(client_secret);
+    let client_pubkey = client_keys.public_key().to_string();
+    ldk_controller::set_owners(vec![client_pubkey.clone()]);
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;
     nwc_client.connect().await;
@@ -689,6 +703,8 @@ async fn test_nwc_make_hold_invoice_roundtrip() -> Result<()> {
     );
 
     let client_keys = Keys::new(client_secret);
+    let client_pubkey = client_keys.public_key().to_string();
+    ldk_controller::set_owners(vec![client_pubkey.clone()]);
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;
     nwc_client.connect().await;
@@ -773,6 +789,8 @@ async fn test_nwc_cancel_hold_invoice_roundtrip() -> Result<()> {
     );
 
     let client_keys = Keys::new(client_secret);
+    let client_pubkey = client_keys.public_key().to_string();
+    ldk_controller::set_owners(vec![client_pubkey.clone()]);
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;
     nwc_client.connect().await;
@@ -850,6 +868,8 @@ async fn test_nwc_settle_hold_invoice_roundtrip() -> Result<()> {
     );
 
     let client_keys = Keys::new(client_secret);
+    let client_pubkey = client_keys.public_key().to_string();
+    ldk_controller::set_owners(vec![client_pubkey.clone()]);
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;
     nwc_client.connect().await;
