@@ -3,9 +3,9 @@ use std::sync::OnceLock;
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
-    ErrorCode, GetBalanceResponse, GetInfoResponse, LookupInvoiceResponse, MakeInvoiceResponse,
-    Method, NIP47Error, PayInvoiceResponse, PayKeysendResponse, Request, RequestParams, Response,
-    ResponseResult, TransactionState, TransactionType,
+    ErrorCode, GetBalanceResponse, GetInfoResponse, LookupInvoiceResponse, MakeHoldInvoiceResponse,
+    MakeInvoiceResponse, Method, NIP47Error, PayInvoiceResponse, PayKeysendResponse, Request,
+    RequestParams, Response, ResponseResult, TransactionState, TransactionType,
 };
 
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
@@ -77,6 +77,7 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::MakeInvoice,
     Method::LookupInvoice,
     Method::ListTransactions,
+    Method::MakeHoldInvoice,
 ];
 
 /// Starts a NWC (Nostr Wallet Connect) service that listens for NIP-47
@@ -429,6 +430,51 @@ impl Handler for ListTransactionsHandler {
     }
 }
 
+struct MakeHoldInvoiceHandler;
+
+impl Handler for MakeHoldInvoiceHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::MakeHoldInvoice(params) = &req.params {
+            if params.payment_hash.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "payment_hash is required".to_string(),
+                });
+            }
+            if params.amount == 0 {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "amount must be greater than 0".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for make_hold_invoice".to_string(),
+        })
+    }
+
+    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+        Ok(Response {
+            result_type: Method::MakeHoldInvoice,
+            error: None,
+            result: Some(ResponseResult::MakeHoldInvoice(MakeHoldInvoiceResponse {
+                transaction_type: TransactionType::Incoming,
+                invoice: None,
+                description: None,
+                description_hash: None,
+                payment_hash: "00".to_string(),
+                amount: 0,
+                created_at: Timestamp::now(),
+                expires_at: Timestamp::now(),
+                metadata: None,
+            })),
+        })
+    }
+}
+
 // Lazily initialize a static handler map to avoid rebuilding it per request.
 fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
     static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
@@ -444,6 +490,7 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
         handlers.insert(Method::MakeInvoice, Box::new(MakeInvoiceHandler));
         handlers.insert(Method::LookupInvoice, Box::new(LookupInvoiceHandler));
         handlers.insert(Method::ListTransactions, Box::new(ListTransactionsHandler));
+        handlers.insert(Method::MakeHoldInvoice, Box::new(MakeHoldInvoiceHandler));
         handlers
     })
 }
