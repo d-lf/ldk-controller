@@ -3,7 +3,8 @@ use std::sync::OnceLock;
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
-    ErrorCode, GetInfoResponse, Method, NIP47Error, Request, Response, ResponseResult,
+    ErrorCode, GetBalanceResponse, GetInfoResponse, Method, NIP47Error, Request, RequestParams,
+    Response, ResponseResult,
 };
 
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
@@ -126,6 +127,12 @@ struct GetInfoHandler;
 
 impl Handler for GetInfoHandler {
     fn validate(&self, _req: &Request) -> Result<(), NIP47Error> {
+        if _req.params != RequestParams::GetInfo {
+            return Err(NIP47Error {
+                code: ErrorCode::Other,
+                message: "invalid params for get_info".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -149,6 +156,28 @@ impl Handler for GetInfoHandler {
     }
 }
 
+struct GetBalanceHandler;
+
+impl Handler for GetBalanceHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if req.params != RequestParams::GetBalance {
+            return Err(NIP47Error {
+                code: ErrorCode::Other,
+                message: "invalid params for get_balance".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+        Ok(Response {
+            result_type: Method::GetBalance,
+            error: None,
+            result: Some(ResponseResult::GetBalance(GetBalanceResponse { balance: 0 })),
+        })
+    }
+}
+
 // Lazily initialize a static handler map to avoid rebuilding it per request.
 fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
     static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
@@ -156,6 +185,7 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
     HANDLERS.get_or_init(|| {
         let mut handlers: HashMap<Method, Box<dyn Handler + Send + Sync>> = HashMap::new();
         handlers.insert(Method::GetInfo, Box::new(GetInfoHandler));
+        handlers.insert(Method::GetBalance, Box::new(GetBalanceHandler));
         handlers
     })
 }
