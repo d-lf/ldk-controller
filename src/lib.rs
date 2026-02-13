@@ -3,8 +3,8 @@ use std::sync::OnceLock;
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
-    ErrorCode, GetBalanceResponse, GetInfoResponse, Method, NIP47Error, PayInvoiceResponse, Request,
-    RequestParams, Response, ResponseResult,
+    ErrorCode, GetBalanceResponse, GetInfoResponse, Method, NIP47Error, PayInvoiceResponse,
+    PayKeysendResponse, Request, RequestParams, Response, ResponseResult,
 };
 
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
@@ -71,6 +71,7 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::GetBalance,
     Method::PayInvoice,
     Method::MultiPayInvoice,
+    Method::PayKeysend,
 ];
 
 /// Starts a NWC (Nostr Wallet Connect) service that listens for NIP-47
@@ -247,6 +248,44 @@ impl Handler for MultiPayInvoiceHandler {
     }
 }
 
+struct PayKeysendHandler;
+
+impl Handler for PayKeysendHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::PayKeysend(params) = &req.params {
+            if params.pubkey.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "pubkey is required".to_string(),
+                });
+            }
+            if params.amount == 0 {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "amount must be greater than 0".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for pay_keysend".to_string(),
+        })
+    }
+
+    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+        Ok(Response {
+            result_type: Method::PayKeysend,
+            error: None,
+            result: Some(ResponseResult::PayKeysend(PayKeysendResponse {
+                preimage: "00".to_string(),
+                fees_paid: Some(0),
+            })),
+        })
+    }
+}
+
 // Lazily initialize a static handler map to avoid rebuilding it per request.
 fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
     static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
@@ -257,6 +296,7 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
         handlers.insert(Method::GetBalance, Box::new(GetBalanceHandler));
         handlers.insert(Method::PayInvoice, Box::new(PayInvoiceHandler));
         handlers.insert(Method::MultiPayInvoice, Box::new(MultiPayInvoiceHandler));
+        handlers.insert(Method::PayKeysend, Box::new(PayKeysendHandler));
         handlers
     })
 }
