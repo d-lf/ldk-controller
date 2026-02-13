@@ -1,5 +1,5 @@
-use nostr_sdk::nips::nip47::{NostrWalletConnectURI, Request, Response};
 use nostr_sdk::prelude::*;
+use nwc::nostr::nips::nip47::{NostrWalletConnectUri, Request, Response};
 use std::time::Duration;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -55,7 +55,7 @@ async fn test_hello_gets_hi_response() -> Result<()> {
 
     // Sender client — simulates an external user sending "hello"
     let sender_keys = Keys::generate();
-    let sender_client = Client::new(sender_keys);
+    let sender_client = Client::builder().signer(sender_keys).build();
     sender_client.add_relay(&relay_url).await?;
     sender_client.connect().await;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -64,7 +64,7 @@ async fn test_hello_gets_hi_response() -> Result<()> {
     let filter = Filter::new()
         .kind(Kind::TextNote)
         .author(app_pubkey);
-    sender_client.subscribe(filter, None).await?;
+    sender_client.subscribe(filter).await?;
 
     // Send "hello"
     let builder = EventBuilder::text_note("hello");
@@ -74,17 +74,17 @@ async fn test_hello_gets_hi_response() -> Result<()> {
     // Wait for the app's "Hi" response (timeout after 10 seconds)
     let timeout = Duration::from_secs(10);
     let result = tokio::time::timeout(timeout, async {
-        sender_client
-            .handle_notifications(|notification| async {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.pubkey == app_pubkey && event.content == "Hi" {
-                        println!("Received 'Hi' from app!");
-                        return Ok(true); // stop listening — test passed
-                    }
+        let mut notifications = sender_client.notifications();
+        while let Some(notification) = notifications.next().await {
+            if let ClientNotification::Event { event, .. } = notification {
+                let event = event.as_ref();
+                if event.pubkey == app_pubkey && event.content == "Hi" {
+                    println!("Received 'Hi' from app!");
+                    break;
                 }
-                Ok(false) // keep listening
-            })
-            .await
+            }
+        }
+        Ok::<(), nostr_sdk::client::Error>(())
     })
     .await;
 
@@ -122,11 +122,12 @@ async fn test_nwc_get_info_roundtrip() -> Result<()> {
     let info_filter = Filter::new()
         .kind(Kind::WalletConnectInfo)
         .author(service_pubkey);
-    let info_client = Client::new(Keys::generate());
+    let info_client = Client::builder().signer(Keys::generate()).build();
     info_client.add_relay(&relay_url).await?;
     info_client.connect().await;
     let info_events = info_client
-        .fetch_events(info_filter, Duration::from_secs(5))
+        .fetch_events(info_filter)
+        .timeout(Duration::from_secs(5))
         .await?;
     assert_eq!(info_events.len(), 1);
     let info_event = info_events.iter().next().unwrap();
@@ -142,7 +143,7 @@ async fn test_nwc_get_info_roundtrip() -> Result<()> {
     // relay, and shared secret for NIP-04 encryption.
     let client_secret = Keys::generate().secret_key().clone();
     let relay = RelayUrl::parse(&relay_url)?;
-    let uri = NostrWalletConnectURI::new(
+    let uri = NostrWalletConnectUri::new(
         service_pubkey,
         vec![relay],
         client_secret.clone(),
@@ -151,7 +152,7 @@ async fn test_nwc_get_info_roundtrip() -> Result<()> {
 
     // Create the NWC client — uses keys derived from the shared secret
     let client_keys = Keys::new(client_secret);
-    let nwc_client = Client::new(client_keys);
+    let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;
     nwc_client.connect().await;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -160,10 +161,11 @@ async fn test_nwc_get_info_roundtrip() -> Result<()> {
     let filter = Filter::new()
         .kind(Kind::WalletConnectResponse)
         .author(service_pubkey);
-    nwc_client.subscribe(filter, None).await?;
+    nwc_client.subscribe(filter).await?;
 
     // Send get_info request (NIP-04 encrypted, Kind 23194)
     let request_event = Request::get_info()
+        // TODO: we should add the encryption method here
         .to_event(&uri)
         .expect("Failed to create NWC request event");
     nwc_client.send_event(&request_event).await?;
@@ -173,29 +175,27 @@ async fn test_nwc_get_info_roundtrip() -> Result<()> {
     let timeout = Duration::from_secs(10);
     let uri_clone = uri.clone();
     let result = tokio::time::timeout(timeout, async {
-        nwc_client
-            .handle_notifications(|notification| async {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind == Kind::WalletConnectResponse
-                        && event.pubkey == service_pubkey
-                    {
-                        let response = Response::from_event(&uri_clone, &event)
-                            .expect("Failed to decrypt NWC response");
+        let mut notifications = nwc_client.notifications();
+        while let Some(notification) = notifications.next().await {
+            if let ClientNotification::Event { event, .. } = notification {
+                let event = event.as_ref();
+                if event.kind == Kind::WalletConnectResponse && event.pubkey == service_pubkey {
+                    let response = Response::from_event(&uri_clone, event)
+                        .expect("Failed to decrypt NWC response");
 
-                        let info = response
-                            .to_get_info()
-                            .expect("Response was not a valid get_info");
+                    let info = response
+                        .to_get_info()
+                        .expect("Response was not a valid get_info");
 
-                        println!("Received get_info response: alias={:?}", info.alias);
-                        assert_eq!(info.alias, Some("ldk-controller".to_string()));
-                        assert_eq!(info.network, Some("regtest".to_string()));
+                    println!("Received get_info response: alias={:?}", info.alias);
+                    assert_eq!(info.alias, Some("ldk-controller".to_string()));
+                    assert_eq!(info.network, Some("regtest".to_string()));
 
-                        return Ok(true); // stop listening — test passed
-                    }
+                    break;
                 }
-                Ok(false)
-            })
-            .await
+            }
+        }
+        Ok::<(), nostr_sdk::client::Error>(())
     })
     .await;
 

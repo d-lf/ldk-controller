@@ -6,7 +6,8 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-nostr-sdk = { version = "0.44", features = ["nip47"] }
+nostr-sdk = { git = "https://github.com/dukeh3/nostr" }
+nwc = { git = "https://github.com/dukeh3/nostr" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 
 [dev-dependencies]

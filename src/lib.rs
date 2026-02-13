@@ -1,6 +1,6 @@
 use nostr_sdk::prelude::*;
-use nostr_sdk::nips::nip04;
-use nostr_sdk::nips::nip47::{
+use nwc::nostr::nips::nip04;
+use nwc::nostr::nips::nip47::{
     ErrorCode, GetInfoResponse, Method, NIP47Error, Request, Response, ResponseResult,
 };
 
@@ -10,14 +10,14 @@ use nostr_sdk::nips::nip47::{
 /// The `client` is returned by reference so the caller (main or tests)
 /// retains access to it for shutdown or further interaction.
 pub async fn run_client(keys: Keys, relay_url: &str) -> Result<Client> {
-    let client = Client::new(keys);
+    let client = Client::builder().signer(keys).build();
     client.add_relay(relay_url).await?;
     println!("Connecting to relay {}...", relay_url);
     client.connect().await;
     println!("Connected!");
 
     let filter = Filter::new().kind(Kind::TextNote);
-    client.subscribe(filter, None).await?;
+    client.subscribe(filter).await?;
     println!("Subscribed to text notes. Listening for events...\n");
 
     // Clone the client so we can use it inside the notification handler
@@ -28,29 +28,28 @@ pub async fn run_client(keys: Keys, relay_url: &str) -> Result<Client> {
     // returns immediately. The caller can keep using the client while
     // events are being handled in the background.
     tokio::spawn(async move {
-        let _ = client_clone
-            .handle_notifications(|notification| async {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    println!(
-                        "--- Event from {} ---",
-                        event.pubkey.to_bech32().unwrap_or_default()
-                    );
-                    println!("{}", event.content);
-                    println!();
+        let mut notifications = client_clone.notifications();
+        while let Some(notification) = notifications.next().await {
+            if let ClientNotification::Event { event, .. } = notification {
+                let event = event.as_ref();
+                println!(
+                    "--- Event from {} ---",
+                    event.pubkey.to_bech32().unwrap_or_default()
+                );
+                println!("{}", event.content);
+                println!();
 
-                    // If the message contains "hello" (case-insensitive),
-                    // respond with "Hi"
-                    if event.content.to_lowercase().contains("hello") {
-                        println!("Responding with Hi...");
-                        let builder = EventBuilder::text_note("Hi");
-                        if let Err(e) = client_clone.send_event_builder(builder).await {
-                            eprintln!("Failed to publish response: {}", e);
-                        }
+                // If the message contains "hello" (case-insensitive),
+                // respond with "Hi"
+                if event.content.to_lowercase().contains("hello") {
+                    println!("Responding with Hi...");
+                    let builder = EventBuilder::text_note("Hi");
+                    if let Err(e) = client_clone.send_event_builder(builder).await {
+                        eprintln!("Failed to publish response: {}", e);
                     }
                 }
-                Ok(false)
-            })
-            .await;
+            }
+        }
     });
 
     Ok(client)
@@ -68,7 +67,7 @@ const SUPPORTED_METHODS: &[Method] = &[Method::GetInfo, Method::GetBalance];
 /// Currently handles `get_info` requests with stub data. Other request
 /// types receive a `NotImplemented` error response.
 pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
-    let client = Client::new(keys.clone());
+    let client = Client::builder().signer(keys.clone()).build();
     client.add_relay(relay_url).await?;
     client.connect().await;
 
@@ -87,25 +86,22 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
     let filter = Filter::new()
         .kind(Kind::WalletConnectRequest)
         .pubkey(our_pubkey);
-    client.subscribe(filter, None).await?;
+    client.subscribe(filter).await?;
 
     let client_clone = client.clone();
 
     tokio::spawn(async move {
-        let _ = client_clone
-            .handle_notifications(|notification| async {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind == Kind::WalletConnectRequest {
-                        if let Err(e) =
-                            handle_nwc_request(&client_clone, &keys, &event).await
-                        {
-                            eprintln!("Failed to handle NWC request: {}", e);
-                        }
+        let mut notifications = client_clone.notifications();
+        while let Some(notification) = notifications.next().await {
+            if let ClientNotification::Event { event, .. } = notification {
+                let event = event.as_ref();
+                if event.kind == Kind::WalletConnectRequest {
+                    if let Err(e) = handle_nwc_request(&client_clone, &keys, event).await {
+                        eprintln!("Failed to handle NWC request: {}", e);
                     }
                 }
-                Ok(false)
-            })
-            .await;
+            }
+        }
     });
 
     Ok(client)
@@ -139,7 +135,7 @@ async fn handle_nwc_request(
             })),
         },
         other => Response {
-            result_type: other,
+            result_type: other.clone(),
             error: Some(NIP47Error {
                 code: ErrorCode::NotImplemented,
                 message: format!("{} not implemented yet", other.as_str()),
