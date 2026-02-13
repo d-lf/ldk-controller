@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
@@ -13,10 +14,22 @@ static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
 static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 #[derive(Debug, Clone)]
 struct AccessRule {
-    rate: u64,
+    capacity_micros: u64,
+    tokens_micros: u64,
+    refill_per_micro: u64,
+    last_refill_micros: u64,
+}
+
+#[derive(Debug, Clone)]
+struct QuotaState {
+    capacity_msat: u64,
+    balance_msat: u64,
+    refill_per_micro: u64,
+    last_refill_micros: u64,
 }
 
 static ACCESS: OnceLock<RwLock<HashMap<String, HashMap<Method, AccessRule>>>> = OnceLock::new();
+static QUOTAS: OnceLock<RwLock<HashMap<String, QuotaState>>> = OnceLock::new();
 
 fn set_global_keys(keys: &Keys) {
     let _ = GLOBAL_KEYS.set(keys.clone());
@@ -38,27 +51,170 @@ fn access() -> &'static RwLock<HashMap<String, HashMap<Method, AccessRule>>> {
     ACCESS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-pub fn set_access_rule(pubkey: &str, method: Method, rate: u64) {
+fn quotas() -> &'static RwLock<HashMap<String, QuotaState>> {
+    QUOTAS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn set_access_rule(pubkey: &str, method: Method, rate_per_micro: u64, capacity: u64) {
+    let now = now_micros();
     let mut map = access().write().expect("access map lock poisoned");
     let entry = map.entry(pubkey.to_string()).or_insert_with(HashMap::new);
-    entry.insert(method, AccessRule { rate });
+    entry.insert(
+        method,
+        AccessRule {
+            capacity_micros: capacity,
+            tokens_micros: capacity,
+            refill_per_micro: rate_per_micro,
+            last_refill_micros: now,
+        },
+    );
+}
+
+pub fn set_quota(pubkey: &str, refill_per_micro: u64, capacity_msat: u64) {
+    let now = now_micros();
+    let mut map = quotas().write().expect("quota map lock poisoned");
+    map.insert(
+        pubkey.to_string(),
+        QuotaState {
+            capacity_msat,
+            balance_msat: capacity_msat,
+            refill_per_micro,
+            last_refill_micros: now,
+        },
+    );
 }
 
 fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     let caller_pubkey = event.pubkey.to_string();
+    
+    // Owners bypass all access checks.
     if owners_contains(&caller_pubkey) {
         return Ok(());
     }
 
-    Err(Response {
-        result_type: request.method.clone(),
+    let mut access_map = access().write().expect("access map lock poisoned");
+
+    // Deny when the caller has no access entry.
+    let methods = access_map
+        .get_mut(&caller_pubkey)
+        .ok_or_else(|| access_denied_response(&request.method))?;
+    
+    // Deny when the method has no access rule.
+    let rule = methods
+        .get_mut(&request.method)
+        .ok_or_else(|| access_denied_response(&request.method))?;
+
+    // Missing or zeroed limits are treated as rate-limited.
+    // TODO: Rethink edge cases once we have JSON in play
+    if rule.capacity_micros == 0 || rule.refill_per_micro == 0 {
+        return Err(rate_limited_response(&request.method));
+    }
+
+    // Refill the token bucket based on elapsed micros.
+    let now = now_micros();
+
+    // Enforce quota for spend-type methods before consuming rate tokens.
+    let amount_msat = request_spend_msat(request);
+
+    let mut quota_map = quotas().write().expect("quota map lock poisoned");
+    let quota = quota_map.get_mut(&caller_pubkey);
+
+    if amount_msat > 0 {
+        if let Some(quota) = quota {
+
+            if quota.refill_per_micro == 0 || quota.capacity_msat == 0 {
+                return Err(quota_exceeded_response(&request.method));
+            }
+
+            let elapsed = now.saturating_sub(quota.last_refill_micros);
+
+            if elapsed > 0 {
+                let added = quota.refill_per_micro.saturating_mul(elapsed);
+                let new_balance = quota.balance_msat.saturating_add(added);
+                quota.balance_msat = new_balance.min(quota.capacity_msat);
+                quota.last_refill_micros = now;
+            }
+
+            if quota.balance_msat < amount_msat {
+                return Err(quota_exceeded_response(&request.method));
+            }
+            quota.balance_msat -= amount_msat;
+        }
+    }
+
+    // Refill
+
+    // Of rate, if rate capped
+    let elapsed = now.saturating_sub(rule.last_refill_micros);
+    
+    if elapsed > 0 {
+        let added = rule.refill_per_micro.saturating_mul(elapsed);
+        let new_tokens = rule.tokens_micros.saturating_add(added);
+        rule.tokens_micros = new_tokens.min(rule.capacity_micros);
+        rule.last_refill_micros = now;
+    }
+
+    // Require at least one token (1_000_000 micros).
+    if rule.tokens_micros < 1_000_000 {
+        return Err(rate_limited_response(&request.method));
+    }
+
+    // Great we have made it apply the changes
+
+    // Consume a token and allow the request.
+    rule.tokens_micros -= 1_000_000;
+    Ok(())
+}
+
+fn access_denied_response(method: &Method) -> Response {
+    Response {
+        result_type: method.clone(),
         error: Some(NIP47Error {
             code: ErrorCode::Restricted,
             message: "access denied, insufficient permission".to_string(),
         }),
         result: None,
-    })
+    }
 }
+
+fn rate_limited_response(method: &Method) -> Response {
+    Response {
+        result_type: method.clone(),
+        error: Some(NIP47Error {
+            code: ErrorCode::RateLimited,
+            message: "rate limit exceeded".to_string(),
+        }),
+        result: None,
+    }
+}
+
+fn quota_exceeded_response(method: &Method) -> Response {
+    Response {
+        result_type: method.clone(),
+        error: Some(NIP47Error {
+            code: ErrorCode::QuotaExceeded,
+            message: "quota exceeded".to_string(),
+        }),
+        result: None,
+    }
+}
+
+fn request_spend_msat(request: &Request) -> u64 {
+    match &request.params {
+        RequestParams::PayInvoice(params) => params.amount.unwrap_or(0),
+        RequestParams::PayKeysend(params) => params.amount,
+        _ => 0,
+    }
+}
+
+fn now_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 
 /// Connects to a nostr relay, subscribes to text notes, and responds
 /// "Hi" to any message containing "hello".
@@ -583,33 +739,6 @@ async fn handle_nwc_request(
     let request = Request::from_json(&decrypted)?;
 
     let response = process_nwc_request(request, event).await;
-    //
-    //
-    //
-    // let response = match request.method {
-    //     Method::GetInfo => Response {
-    //         result_type: Method::GetInfo,
-    //         error: None,
-    //         result: Some(ResponseResult::GetInfo(GetInfoResponse {
-    //             alias: Some("ldk-controller".to_string()),
-    //             color: None,
-    //             pubkey: Some(keys.public_key().to_string()),
-    //             network: Some("regtest".to_string()),
-    //             block_height: Some(0),
-    //             block_hash: None,
-    //             methods: SUPPORTED_METHODS.to_vec(),
-    //             notifications: vec![],
-    //         })),
-    //     },
-    //     other => Response {
-    //         result_type: other.clone(),
-    //         error: Some(NIP47Error {
-    //             code: ErrorCode::NotImplemented,
-    //             message: format!("{} not implemented yet", other.as_str()),
-    //         }),
-    //         result: None,
-    //     },
-    // };
 
     // Encrypt the response for the sender
     let response_json = response.as_json();
