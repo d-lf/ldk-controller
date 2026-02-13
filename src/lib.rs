@@ -72,6 +72,7 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::PayInvoice,
     Method::MultiPayInvoice,
     Method::PayKeysend,
+    Method::MultiPayKeysend,
 ];
 
 /// Starts a NWC (Nostr Wallet Connect) service that listens for NIP-47
@@ -286,6 +287,38 @@ impl Handler for PayKeysendHandler {
     }
 }
 
+struct MultiPayKeysendHandler;
+
+impl Handler for MultiPayKeysendHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::MultiPayKeysend(params) = &req.params {
+            if params.keysends.is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "keysends list is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for multi_pay_keysend".to_string(),
+        })
+    }
+
+    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+        Ok(Response {
+            result_type: Method::MultiPayKeysend,
+            error: None,
+            result: Some(ResponseResult::MultiPayKeysend(PayKeysendResponse {
+                preimage: "00".to_string(),
+                fees_paid: Some(0),
+            })),
+        })
+    }
+}
+
 // Lazily initialize a static handler map to avoid rebuilding it per request.
 fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
     static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
@@ -297,6 +330,7 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
         handlers.insert(Method::PayInvoice, Box::new(PayInvoiceHandler));
         handlers.insert(Method::MultiPayInvoice, Box::new(MultiPayInvoiceHandler));
         handlers.insert(Method::PayKeysend, Box::new(PayKeysendHandler));
+        handlers.insert(Method::MultiPayKeysend, Box::new(MultiPayKeysendHandler));
         handlers
     })
 }
