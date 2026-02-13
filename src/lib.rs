@@ -76,6 +76,7 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::MultiPayKeysend,
     Method::MakeInvoice,
     Method::LookupInvoice,
+    Method::ListTransactions,
 ];
 
 /// Starts a NWC (Nostr Wallet Connect) service that listens for NIP-47
@@ -405,6 +406,29 @@ impl Handler for LookupInvoiceHandler {
     }
 }
 
+struct ListTransactionsHandler;
+
+impl Handler for ListTransactionsHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::ListTransactions(_) = &req.params {
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for list_transactions".to_string(),
+        })
+    }
+
+    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+        Ok(Response {
+            result_type: Method::ListTransactions,
+            error: None,
+            result: Some(ResponseResult::ListTransactions(Vec::new())),
+        })
+    }
+}
+
 // Lazily initialize a static handler map to avoid rebuilding it per request.
 fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
     static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
@@ -419,6 +443,7 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
         handlers.insert(Method::MultiPayKeysend, Box::new(MultiPayKeysendHandler));
         handlers.insert(Method::MakeInvoice, Box::new(MakeInvoiceHandler));
         handlers.insert(Method::LookupInvoice, Box::new(LookupInvoiceHandler));
+        handlers.insert(Method::ListTransactions, Box::new(ListTransactionsHandler));
         handlers
     })
 }
