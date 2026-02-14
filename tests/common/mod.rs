@@ -1,9 +1,12 @@
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
     GenericImage,
 };
+use nostr_sdk::prelude::*;
+use ldk_controller::UsageProfile;
 
 /// Starts a fresh strfry relay container and returns (container, relay_url).
 /// The container is automatically removed when dropped.
@@ -35,4 +38,28 @@ pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .expect("test lock poisoned")
+}
+
+#[allow(dead_code)]
+pub async fn grant_usage_profile(
+    owner_keys: &Keys,
+    relay_url: &str,
+    relay_pubkey: PublicKey,
+    target_pubkey: PublicKey,
+    profile: &UsageProfile,
+) -> Result<()> {
+    let content = serde_json::to_string(profile).expect("serialize UsageProfile");
+    let d_value = format!("{}:{}", relay_pubkey, target_pubkey);
+
+    let owner_client = Client::builder().signer(owner_keys.clone()).build();
+    owner_client.add_relay(relay_url).await?;
+    owner_client.connect().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let grant_event = EventBuilder::new(Kind::Custom(30078), content)
+        .tag(Tag::parse(["d", d_value.as_str()]).expect("create d tag"))
+        .tag(Tag::public_key(relay_pubkey));
+    owner_client.send_event_builder(grant_event).await?;
+
+    Ok(())
 }

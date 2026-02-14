@@ -7,7 +7,7 @@ use nwc::nostr::nips::nip47::Method;
 use ldk_controller::{MethodAccessRule, UsageProfile};
 
 mod common;
-use common::{start_relay, test_guard};
+use common::{grant_usage_profile, start_relay, test_guard};
 
 /// End-to-end test: publish a UsageProfile grant and re-read it from the relay.
 #[tokio::test]
@@ -17,10 +17,6 @@ async fn test_publish_and_read_access_grant() -> Result<()> {
 
     let owner_keys = Keys::generate();
     let owner_pubkey = owner_keys.public_key();
-    let owner = Client::builder().signer(owner_keys).build();
-    owner.add_relay(&relay_url).await?;
-    owner.connect().await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     let relay_pubkey = Keys::generate().public_key();
     let user_pubkey = Keys::generate().public_key();
@@ -37,13 +33,7 @@ async fn test_publish_and_read_access_grant() -> Result<()> {
         quota: None,
         methods: Some(methods),
     };
-    let content = serde_json::to_string(&profile).expect("serialize UsageProfile");
-
-    let grant_event = EventBuilder::new(Kind::Custom(30078), content)
-        .tag(Tag::parse(["d", d_value.as_str()]).expect("create d tag"))
-        .tag(Tag::public_key(relay_pubkey));
-
-    owner.send_event_builder(grant_event).await?;
+    grant_usage_profile(&owner_keys, &relay_url, relay_pubkey, user_pubkey, &profile).await?;
 
     let reader = Client::builder().signer(Keys::generate()).build();
     reader.add_relay(&relay_url).await?;

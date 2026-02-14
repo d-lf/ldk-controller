@@ -6,7 +6,7 @@ use std::time::Duration;
 use ldk_controller::{clear_usage_profiles, set_relay_pubkey, MethodAccessRule, UsageProfile};
 
 mod common;
-use common::{start_relay, test_guard};
+use common::{grant_usage_profile, start_relay, test_guard};
 
 /// End-to-end test: send a NWC get_balance request, expect a valid response.
 #[tokio::test]
@@ -47,19 +47,8 @@ async fn test_nwc_get_balance_roundtrip() -> Result<()> {
         quota: None,
         methods: Some(methods),
     };
-    let content = serde_json::to_string(&profile).expect("serialize UsageProfile");
-    let d_value = format!("{}:{}", relay_pubkey, client_pubkey);
-
     let owner_keys = Keys::generate();
-    let owner_client = Client::builder().signer(owner_keys).build();
-    owner_client.add_relay(&relay_url).await?;
-    owner_client.connect().await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let grant_event = EventBuilder::new(Kind::Custom(30078), content)
-        .tag(Tag::parse(["d", d_value.as_str()]).expect("create d tag"))
-        .tag(Tag::public_key(relay_pubkey));
-    owner_client.send_event_builder(grant_event).await?;
+    grant_usage_profile(&owner_keys, &relay_url, relay_pubkey, client_pubkey, &profile).await?;
 
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;

@@ -16,21 +16,6 @@ pub use usage_profile::{MethodAccessRule, RateLimitRule, UsageProfile};
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
 static RELAY_PUBKEY: OnceLock<PublicKey> = OnceLock::new();
 static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
-#[derive(Debug, Clone)]
-struct AccessRule {
-    capacity_micros: u64,
-    tokens_micros: u64,
-    refill_per_micro: u64,
-    last_refill_micros: u64,
-}
-
-#[derive(Debug, Clone)]
-struct QuotaState {
-    capacity_msat: u64,
-    balance_msat: u64,
-    refill_per_micro: u64,
-    last_refill_micros: u64,
-}
 
 #[derive(Clone)]
 struct RateState {
@@ -44,9 +29,6 @@ struct AccessState {
 }
 
 static ACCESS_STATE: OnceLock<AccessState> = OnceLock::new();
-
-static ACCESS: OnceLock<RwLock<HashMap<String, HashMap<Method, AccessRule>>>> = OnceLock::new();
-static QUOTAS: OnceLock<RwLock<HashMap<String, QuotaState>>> = OnceLock::new();
 static USAGE_PROFILES: OnceLock<RwLock<HashMap<String, UsageProfile>>> = OnceLock::new();
 
 fn set_global_keys(keys: &Keys) {
@@ -61,20 +43,6 @@ pub fn set_owners(owners: Vec<String>) {
     let lock = OWNERS.get_or_init(|| RwLock::new(Vec::new()));
     let mut guard = lock.write().expect("owners lock poisoned");
     *guard = owners;
-}
-
-fn owners_contains(pubkey: &str) -> bool {
-    let lock = OWNERS.get_or_init(|| RwLock::new(Vec::new()));
-    let guard = lock.read().expect("owners lock poisoned");
-    guard.iter().any(|owner| owner == pubkey)
-}
-
-fn access() -> &'static RwLock<HashMap<String, HashMap<Method, AccessRule>>> {
-    ACCESS.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-fn quotas() -> &'static RwLock<HashMap<String, QuotaState>> {
-    QUOTAS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn access_state() -> &'static AccessState {
@@ -128,194 +96,9 @@ fn upsert_usage_profile(target_pubkey: &str, profile: UsageProfile) {
     map.insert(target_pubkey.to_string(), profile);
 }
 
-pub fn set_access_rule(pubkey: &str, method: Method, rate_per_micro: u64, capacity: u64) {
-    let now = now_micros();
-    let mut map = access().write().expect("access map lock poisoned");
-    let entry = map.entry(pubkey.to_string()).or_insert_with(HashMap::new);
-    entry.insert(
-        method,
-        AccessRule {
-            capacity_micros: capacity,
-            tokens_micros: capacity,
-            refill_per_micro: rate_per_micro,
-            last_refill_micros: now,
-        },
-    );
-}
-
-pub fn set_quota(pubkey: &str, refill_per_micro: u64, capacity_msat: u64) {
-    let now = now_micros();
-    let mut map = quotas().write().expect("quota map lock poisoned");
-    map.insert(
-        pubkey.to_string(),
-        QuotaState {
-            capacity_msat,
-            balance_msat: capacity_msat,
-            refill_per_micro,
-            last_refill_micros: now,
-        },
-    );
-}
-
-fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
-    let caller_pubkey = event.pubkey.to_string();
-
-    // Owners bypass all access checks.
-    if owners_contains(&caller_pubkey) {
-        return Ok(());
-    }
-
-    let mut access_map = access().write().expect("access map lock poisoned");
-
-    // Deny when the caller has no access entry.
-    let methods = access_map
-        .get_mut(&caller_pubkey)
-        .ok_or_else(|| access_denied_response(&request.method))?;
-
-    // Deny when the method has no access rule.
-    let rule = methods
-        .get_mut(&request.method)
-        .ok_or_else(|| access_denied_response(&request.method))?;
-
-    // Missing or zeroed limits are treated as rate-limited.
-    // TODO: Rethink edge cases once we have JSON in play
-    if rule.capacity_micros == 0 || rule.refill_per_micro == 0 {
-        return Err(rate_limited_response(&request.method));
-    }
-
-    // Refill the token bucket based on elapsed micros.
-    let now = now_micros();
-
-    // Enforce quota for spend-type methods before consuming rate tokens.
-    let amount_msat = request_spend_msat(request);
-
-    let mut quota_map = quotas().write().expect("quota map lock poisoned");
-    // let quota = quota_map.get_mut(&caller_pubkey);
-
-    let mut new_balance: Option<u64> = None;
-
-    if let Some(amount_msat) = amount_msat {
-        if let Some(quota) = quota_map.get(&caller_pubkey) {
-            // if quota.refill_per_micro == 0 || quota.capacity_msat == 0 {
-            //     return Err(quota_exceeded_response(&request.method));
-            // }
-
-            let mut calc_balance = quota.balance_msat;
-
-            let elapsed = now.saturating_sub(quota.last_refill_micros);
-
-            if elapsed > 0 {
-                let added = quota.refill_per_micro.saturating_mul(elapsed);
-                calc_balance = calc_balance.saturating_add(added).min(quota.capacity_msat);
-                // quota.balance_msat = new_balance.min(quota.capacity_msat);
-                // quota.last_refill_micros = now;
-            }
-
-            if calc_balance < amount_msat {
-                return Err(quota_exceeded_response(&request.method));
-            }
-
-            calc_balance -= amount_msat;
-            new_balance = Some(calc_balance);
-        }
-    }
-
-    // Refill
-
-    // Of rate, if rate capped
-    let elapsed = now.saturating_sub(rule.last_refill_micros);
-
-    if elapsed > 0 {
-        let added = rule.refill_per_micro.saturating_mul(elapsed);
-        let new_tokens = rule.tokens_micros.saturating_add(added);
-        rule.tokens_micros = new_tokens.min(rule.capacity_micros);
-        rule.last_refill_micros = now;
-    }
-
-    // Require at least one token (1_000_000 micros).
-    if rule.tokens_micros < 1_000_000 {
-        return Err(rate_limited_response(&request.method));
-    }
-
-    // Great we have made it apply the changes
-
-    // Update
-    // Consume a token and allow the request.
-    rule.tokens_micros -= 1_000_000;
-
-    if let Some(new_balance) = new_balance {
-        if let Some(quota) = quota_map.get_mut(&caller_pubkey) {
-            quota.balance_msat = new_balance;
-            quota.last_refill_micros = now;
-        }
-    }
-
-    Ok(())
-}
-
-fn verify_access_new(request: &Request, event: &Event) -> Result<(), Response> {
-    let caller_pubkey = event.pubkey.to_string();
-
-    // Owners bypass all access checks and limits.
-    if owners_contains(&caller_pubkey) {
-        return Ok(());
-    }
-
-    // Require an existing rate state for this caller+method. Do not create it here.
-    let access_state = access_state();
-    let key = (caller_pubkey.clone(), request.method.clone());
-    let mut access_rate = access_state
-        .access_rate
-        .write()
-        .expect("access state rate lock poisoned");
-    let rate_state = access_rate
-        .get_mut(&key)
-        .ok_or_else(|| access_denied_response(&request.method))?;
-
-    // If this request spends msats, enforce quota before touching rate.
-    let amount_msat = request_spend_msat(request);
-    if let Some(amount_msat) = amount_msat {
-        // If the request explicitly spends 0, skip quota checks entirely.
-        if amount_msat == 0 {
-            // No quota impact.
-        } else {
-            // Require an existing quota state for this caller. Do not create it here.
-            let mut quota_map = access_state
-                .quota
-                .write()
-                .expect("quota state lock poisoned");
-            let quota_state = quota_map
-                .get_mut(&caller_pubkey)
-                .ok_or_else(|| access_denied_response(&request.method))?;
-
-            // Fail fast if the quota balance cannot cover the spend.
-            if quota_state.balance < amount_msat {
-                return Err(quota_exceeded_response(&request.method));
-            }
-
-            // Apply the quota consumption only after all quota checks pass.
-            quota_state.balance -= amount_msat;
-        }
-    }
-
-    // Fail fast if the rate balance cannot cover a single request token.
-    if rate_state.balance < 1_000_000 {
-        return Err(rate_limited_response(&request.method));
-    }
-
-    // Apply the rate consumption only after all checks pass.
-    rate_state.balance -= 1_000_000;
-
-    Ok(())
-}
 
 fn verify_access_new_new(request: &Request, event: &Event) -> Result<(), Response> {
     let caller_pubkey = event.pubkey.to_string();
-
-    // Owners bypass all access checks.
-    if owners_contains(&caller_pubkey) {
-        return Ok(());
-    }
 
     // Require a UsageProfile grant for the caller.
     let profile = {
@@ -1084,10 +867,6 @@ async fn process_nwc_request(request: Request, event: &Event) -> Response {
 }
 
 fn allowed_methods_for(caller_pubkey: &str) -> Vec<Method> {
-    if owners_contains(caller_pubkey) {
-        return SUPPORTED_METHODS.to_vec();
-    }
-
     let profile = {
         let map = usage_profiles()
             .read()

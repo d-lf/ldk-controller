@@ -6,7 +6,7 @@ use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip47::{Method, NostrWalletConnectUri, Request, Response};
 
 mod common;
-use common::{start_relay, test_guard};
+use common::{grant_usage_profile, start_relay, test_guard};
 
 /// End-to-end test: owner grants get_info to a user, user calls get_info and succeeds.
 #[tokio::test]
@@ -27,17 +27,9 @@ async fn test_get_info_with_granted_profile() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(1)).await;
     println!("Service started with pubkey {}", service_pubkey);
 
-    // Owner publishes grant for user.
-    let owner_keys = Keys::generate();
-    let owner_client = Client::builder().signer(owner_keys).build();
-    owner_client.add_relay(&relay_url).await?;
-    owner_client.connect().await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
     let user_keys = Keys::generate();
     let user_pubkey = user_keys.public_key();
-    let d_value = format!("{}:{}", relay_pubkey, user_pubkey);
-    println!("Grant target d tag: {}", d_value);
+    println!("Grant target pubkey: {}", user_pubkey);
 
     let mut methods = HashMap::new();
     methods.insert(
@@ -50,12 +42,8 @@ async fn test_get_info_with_granted_profile() -> Result<()> {
         quota: None,
         methods: Some(methods),
     };
-    let content = serde_json::to_string(&profile).expect("serialize UsageProfile");
-
-    let grant_event = EventBuilder::new(Kind::Custom(30078), content)
-        .tag(Tag::parse(["d", d_value.as_str()]).expect("create d tag"))
-        .tag(Tag::public_key(relay_pubkey));
-    owner_client.send_event_builder(grant_event).await?;
+    let owner_keys = Keys::generate();
+    grant_usage_profile(&owner_keys, &relay_url, relay_pubkey, user_pubkey, &profile).await?;
     println!("Grant event published");
 
     // Build NWC URI for the user to talk to the service.
