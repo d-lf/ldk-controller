@@ -1,0 +1,144 @@
+use nostr_sdk::prelude::*;
+use nwc::nostr::nips::nip47::{Method, NostrWalletConnectUri, Request, Response};
+use std::collections::HashMap;
+use std::time::Duration;
+
+use ldk_controller::{clear_usage_profiles, set_relay_pubkey, MethodAccessRule, RateLimitRule, UsageProfile};
+
+mod common;
+use common::{start_relay, test_guard};
+
+/// End-to-end test: access rule allows one call, second should be rate-limited.
+#[tokio::test]
+async fn test_nwc_get_info_rate_limited_after_one_call() -> Result<()> {
+    let _guard = test_guard();
+    clear_usage_profiles();
+    let (_container, relay_url) = start_relay().await;
+
+    let relay_pubkey = Keys::generate().public_key();
+    set_relay_pubkey(relay_pubkey.clone());
+
+    let service_keys = Keys::generate();
+    let service_pubkey = service_keys.public_key();
+    let _service_client = ldk_controller::run_nwc_service(service_keys, &relay_url).await?;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let client_secret = Keys::generate().secret_key().clone();
+    let relay = RelayUrl::parse(&relay_url)?;
+    let uri = NostrWalletConnectUri::new(
+        service_pubkey,
+        vec![relay],
+        client_secret.clone(),
+        None,
+    );
+
+    let client_keys = Keys::new(client_secret);
+    let client_pubkey = client_keys.public_key();
+
+    let mut methods = HashMap::new();
+    methods.insert(
+        Method::GetInfo,
+        MethodAccessRule {
+            access_rate: Some(RateLimitRule {
+                rate_per_micro: 0,
+                max_capacity: 1_000_000,
+            }),
+        },
+    );
+    let profile = UsageProfile {
+        quota: None,
+        methods: Some(methods),
+    };
+    let content = serde_json::to_string(&profile).expect("serialize UsageProfile");
+    let d_value = format!("{}:{}", relay_pubkey, client_pubkey);
+
+    let owner_keys = Keys::generate();
+    let owner_client = Client::builder().signer(owner_keys).build();
+    owner_client.add_relay(&relay_url).await?;
+    owner_client.connect().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let grant_event = EventBuilder::new(Kind::Custom(30078), content)
+        .tag(Tag::parse(["d", d_value.as_str()]).expect("create d tag"))
+        .tag(Tag::public_key(relay_pubkey));
+    owner_client.send_event_builder(grant_event).await?;
+
+    let nwc_client = Client::builder().signer(client_keys).build();
+    nwc_client.add_relay(&relay_url).await?;
+    nwc_client.connect().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let filter = Filter::new()
+        .kind(Kind::WalletConnectResponse)
+        .author(service_pubkey);
+    nwc_client.subscribe(filter).await?;
+
+    // First call should succeed (consume the only token).
+    let request_event = Request::get_info()
+        .to_event(&uri)
+        .expect("Failed to create NWC request event");
+    nwc_client.send_event(&request_event).await?;
+
+    let timeout = Duration::from_secs(10);
+    let uri_clone = uri.clone();
+    let result = tokio::time::timeout(timeout, async {
+        let mut notifications = nwc_client.notifications();
+        while let Some(notification) = notifications.next().await {
+            if let ClientNotification::Event { event, .. } = notification {
+                let event = event.as_ref();
+                if event.kind == Kind::WalletConnectResponse && event.pubkey == service_pubkey {
+                    let response = Response::from_event(&uri_clone, event)
+                        .expect("Failed to decrypt NWC response");
+
+                    let _info = response
+                        .to_get_info()
+                        .expect("First response should be get_info");
+                    break;
+                }
+            }
+        }
+        Ok::<(), nostr_sdk::client::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("Notification handler error: {}", e),
+        Err(_) => panic!("Timeout: did not receive first NWC response within 10 seconds"),
+    }
+
+    // Second call should be rate-limited.
+    let request_event = Request::get_info()
+        .to_event(&uri)
+        .expect("Failed to create NWC request event");
+    nwc_client.send_event(&request_event).await?;
+
+    let uri_clone = uri.clone();
+    let result = tokio::time::timeout(timeout, async {
+        let mut notifications = nwc_client.notifications();
+        while let Some(notification) = notifications.next().await {
+            if let ClientNotification::Event { event, .. } = notification {
+                let event = event.as_ref();
+                if event.kind == Kind::WalletConnectResponse && event.pubkey == service_pubkey {
+                    let response = Response::from_event(&uri_clone, event)
+                        .expect("Failed to decrypt NWC response");
+
+                    assert_eq!(response.result_type, Method::GetInfo);
+                    let err = response.error.expect("Expected rate-limited error");
+                    assert_eq!(err.code, nwc::nostr::nips::nip47::ErrorCode::RateLimited);
+                    assert_eq!(err.message, "rate limit exceeded".to_string());
+                    break;
+                }
+            }
+        }
+        Ok::<(), nostr_sdk::client::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => panic!("Notification handler error: {}", e),
+        Err(_) => panic!("Timeout: did not receive second NWC response within 10 seconds"),
+    }
+}
