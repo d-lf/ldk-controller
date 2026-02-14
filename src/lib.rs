@@ -455,7 +455,7 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
 
 trait Handler: Send + Sync {
     fn validate(&self, req: &Request) -> Result<(), NIP47Error>;
-    fn execute(&self, req: &Request) -> Result<Response, NIP47Error>;
+    fn execute(&self, req: &Request, caller_pubkey: &str) -> Result<Response, NIP47Error>;
 }
 
 struct GetInfoHandler;
@@ -471,7 +471,8 @@ impl Handler for GetInfoHandler {
         Ok(())
     }
 
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+    fn execute(&self, _req: &Request, caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let methods = allowed_methods_for(caller_pubkey);
         Ok(Response {
             result_type: Method::GetInfo,
             error: None,
@@ -482,7 +483,7 @@ impl Handler for GetInfoHandler {
                 network: Some("regtest".to_string()),
                 block_height: Some(0),
                 block_hash: None,
-                methods: SUPPORTED_METHODS.to_vec(),
+                methods,
                 notifications: vec![],
             })),
         })
@@ -502,7 +503,7 @@ impl Handler for GetBalanceHandler {
         Ok(())
     }
 
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
         Ok(Response {
             result_type: Method::GetBalance,
             error: None,
@@ -533,7 +534,7 @@ impl Handler for PayInvoiceHandler {
         })
     }
 
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
         Ok(Response {
             result_type: Method::PayInvoice,
             error: None,
@@ -571,7 +572,7 @@ impl Handler for PayKeysendHandler {
         })
     }
 
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
         Ok(Response {
             result_type: Method::PayKeysend,
             error: None,
@@ -603,7 +604,7 @@ impl Handler for MakeInvoiceHandler {
         })
     }
 
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
         Ok(Response {
             result_type: Method::MakeInvoice,
             error: None,
@@ -643,7 +644,7 @@ impl Handler for LookupInvoiceHandler {
         })
     }
 
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
         Ok(Response {
             result_type: Method::LookupInvoice,
             error: None,
@@ -680,7 +681,7 @@ impl Handler for ListTransactionsHandler {
         })
     }
 
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
         Ok(Response {
             result_type: Method::ListTransactions,
             error: None,
@@ -715,7 +716,7 @@ impl Handler for MakeHoldInvoiceHandler {
         })
     }
 
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
         Ok(Response {
             result_type: Method::MakeHoldInvoice,
             error: None,
@@ -754,7 +755,7 @@ impl Handler for CancelHoldInvoiceHandler {
         })
     }
 
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
         Ok(Response {
             result_type: Method::CancelHoldInvoice,
             error: None,
@@ -785,7 +786,7 @@ impl Handler for SettleHoldInvoiceHandler {
         })
     }
 
-    fn execute(&self, _req: &Request) -> Result<Response, NIP47Error> {
+    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
         Ok(Response {
             result_type: Method::SettleHoldInvoice,
             error: None,
@@ -853,17 +854,7 @@ async fn process_nwc_request(request: Request, event: &Event) -> Response {
     }
 
     // Execute the request
-    let mut response = handler.execute(&request).unwrap();
-
-    // Filter get_info methods to those the caller can access.
-    if response.result_type == Method::GetInfo {
-        if let Some(ResponseResult::GetInfo(info)) = response.result.as_mut() {
-            let caller_pubkey = event.pubkey.to_string();
-            info.methods = allowed_methods_for(&caller_pubkey);
-        }
-    }
-
-    response
+    handler.execute(&request, &event.pubkey.to_string()).unwrap()
 }
 
 fn allowed_methods_for(caller_pubkey: &str) -> Vec<Method> {
