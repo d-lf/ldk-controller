@@ -8,12 +8,13 @@ use nwc::nostr::nips::nip47::{
 };
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod usage_profile;
 
 pub use usage_profile::{MethodAccessRule, RateLimitRule, UsageProfile};
 
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
+static RELAY_PUBKEY: OnceLock<PublicKey> = OnceLock::new();
 static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 #[derive(Debug, Clone)]
 struct AccessRule {
@@ -45,9 +46,14 @@ static ACCESS_STATE: OnceLock<AccessState> = OnceLock::new();
 
 static ACCESS: OnceLock<RwLock<HashMap<String, HashMap<Method, AccessRule>>>> = OnceLock::new();
 static QUOTAS: OnceLock<RwLock<HashMap<String, QuotaState>>> = OnceLock::new();
+static USAGE_PROFILES: OnceLock<RwLock<HashMap<String, UsageProfile>>> = OnceLock::new();
 
 fn set_global_keys(keys: &Keys) {
     let _ = GLOBAL_KEYS.set(keys.clone());
+}
+
+pub fn set_relay_pubkey(pubkey: PublicKey) {
+    let _ = RELAY_PUBKEY.set(pubkey);
 }
 
 pub fn set_owners(owners: Vec<String>) {
@@ -75,6 +81,50 @@ fn access_state() -> &'static AccessState {
         access_rate: RwLock::new(HashMap::new()),
         quota: RwLock::new(HashMap::new()),
     })
+}
+
+fn usage_profiles() -> &'static RwLock<HashMap<String, UsageProfile>> {
+    USAGE_PROFILES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn get_usage_profile(pubkey: &str) -> Option<UsageProfile> {
+    let map = usage_profiles()
+        .read()
+        .expect("usage profile map lock poisoned");
+    map.get(pubkey).cloned()
+}
+
+pub fn clear_usage_profiles() {
+    let mut map = usage_profiles()
+        .write()
+        .expect("usage profile map lock poisoned");
+    map.clear();
+}
+
+fn parse_grant_target(event: &Event) -> Option<String> {
+    let d_tag = event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        if parts.get(0).map(|v| v.as_str()) == Some("d") {
+            parts.get(1).cloned()
+        } else {
+            None
+        }
+    })?;
+    let mut parts = d_tag.splitn(2, ':');
+    let _relay_pubkey = parts.next()?;
+    let user_pubkey = parts.next()?;
+    if user_pubkey.is_empty() {
+        None
+    } else {
+        Some(user_pubkey.to_string())
+    }
+}
+
+fn upsert_usage_profile(target_pubkey: &str, profile: UsageProfile) {
+    let mut map = usage_profiles()
+        .write()
+        .expect("usage profile map lock poisoned");
+    map.insert(target_pubkey.to_string(), profile);
 }
 
 pub fn set_access_rule(pubkey: &str, method: Method, rate_per_micro: u64, capacity: u64) {
@@ -404,17 +454,66 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
         .pubkey(our_pubkey);
     client.subscribe(filter).await?;
 
+    // Subscribe to access grant updates (Kind 30078).
+    let grants_filter = if let Some(relay_pubkey) = RELAY_PUBKEY.get() {
+        Filter::new()
+            .kind(Kind::Custom(30078))
+            .pubkey(relay_pubkey.clone())
+    } else {
+        Filter::new().kind(Kind::Custom(30078))
+    };
+    client.subscribe(grants_filter.clone()).await?;
+
     let client_clone = client.clone();
+    let grants_client = client.clone();
+    let grants_filter_clone = grants_filter.clone();
+
+    // Periodically fetch access grants in case subscription events are missed.
+    tokio::spawn(async move {
+        loop {
+            if let Ok(events) = grants_client
+                .fetch_events(grants_filter_clone.clone())
+                .timeout(Duration::from_secs(2))
+                .await
+            {
+                for event in events.iter() {
+                    if let Some(target_pubkey) = parse_grant_target(event) {
+                        if let Ok(profile) = serde_json::from_str::<UsageProfile>(&event.content) {
+                            upsert_usage_profile(&target_pubkey, profile);
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
 
     tokio::spawn(async move {
         let mut notifications = client_clone.notifications();
         while let Some(notification) = notifications.next().await {
             if let ClientNotification::Event { event, .. } = notification {
                 let event = event.as_ref();
-                if event.kind == Kind::WalletConnectRequest {
-                    if let Err(e) = handle_nwc_request(&client_clone, &keys, event).await {
-                        eprintln!("Failed to handle NWC request: {}", e);
+                match event.kind {
+                    Kind::WalletConnectRequest => {
+                        if let Err(e) = handle_nwc_request(&client_clone, &keys, event).await {
+                            eprintln!("Failed to handle NWC request: {}", e);
+                        }
                     }
+                    Kind::Custom(30078) => {
+                        if let Some(target_pubkey) = parse_grant_target(event) {
+                            match serde_json::from_str::<UsageProfile>(&event.content) {
+                                Ok(profile) => {
+                                    upsert_usage_profile(&target_pubkey, profile);
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to parse UsageProfile: {}", e);
+                                }
+                            }
+                        } else {
+                            eprintln!("Access grant event missing or invalid d tag");
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
