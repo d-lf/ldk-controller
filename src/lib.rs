@@ -24,8 +24,8 @@ struct RateState {
 }
 
 struct AccessState {
-    access_rate: RwLock<HashMap<(String, Method), RateState>>,   // per‑method access rate
-    quota: RwLock<HashMap<String, RateState>>,            // per‑user quota rate
+    access_rate: RwLock<HashMap<(String, Method), RateState>>, // per‑method access rate
+    quota: RwLock<HashMap<String, RateState>>,                 // per‑user quota rate
 }
 
 static ACCESS_STATE: OnceLock<AccessState> = OnceLock::new();
@@ -96,8 +96,27 @@ fn upsert_usage_profile(target_pubkey: &str, profile: UsageProfile) {
     map.insert(target_pubkey.to_string(), profile);
 }
 
+fn calculate_forecast(
+    amount: &u64,
+    now: &u64,
+    current: &RateState,
+    rule: &RateLimitRule,
+) -> Result<u64, String> {
+    let elapsed = now.saturating_sub(current.last_refill_micros);
+    let added = rule.rate_per_micro.saturating_mul(elapsed);
+    let forecasted = current.balance.saturating_add(added).min(rule.max_capacity);
 
-fn verify_access_new_new(request: &Request, event: &Event) -> Result<(), Response> {
+    if forecasted < *amount {
+        return Err(format!(
+            "forecasted balance {} is less than amount {}",
+            forecasted, amount
+        ));
+    }
+
+    Ok(forecasted.saturating_sub(*amount))
+}
+
+fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     let caller_pubkey = event.pubkey.to_string();
 
     // Require a UsageProfile grant for the caller.
@@ -127,40 +146,30 @@ fn verify_access_new_new(request: &Request, event: &Event) -> Result<(), Respons
 
     // Prepare rate limit state updates, but only apply if all checks pass.
     let mut rate_update: Option<(RateState, RateState)> = None;
-    
-    
+
     if let Some(rule) = method_rule.as_ref().and_then(|r| r.access_rate.as_ref()) {
         let key = (caller_pubkey.clone(), request.method.clone());
 
+        // Get the current state of the access_rate
         let current = {
             let access_rates = access_state()
                 .access_rate
                 .read()
                 .expect("access state rate lock poisoned");
-            access_rates
-                .get(&key)
-                .cloned()
-                .unwrap_or(RateState {
-                    balance: rule.max_capacity,
-                    last_refill_micros: now,
-                })
+            access_rates.get(&key).cloned().unwrap_or(RateState {
+                balance: rule.max_capacity,
+                last_refill_micros: now,
+            })
         };
 
-        let elapsed = now.saturating_sub(current.last_refill_micros);
-        let added = rule.rate_per_micro.saturating_mul(elapsed);
-        let forecasted = current
-            .balance
-            .saturating_add(added)
-            .min(rule.max_capacity);
+        let amount = 1_000_000;
 
-        // check if we are below the rate
-        if forecasted < 1_000_000 {
-            return Err(rate_limited_response(&request.method));
-        }
+        let new_value = calculate_forecast(&amount, &now, &current, rule)
+            .map_err(|_| rate_limited_response(&request.method))?;
 
         // This is the new state
         let new_state = RateState {
-            balance: forecasted.saturating_sub(1_000_000),
+            balance: new_value,
             last_refill_micros: now,
         };
 
@@ -177,30 +186,19 @@ fn verify_access_new_new(request: &Request, event: &Event) -> Result<(), Respons
                     .quota
                     .read()
                     .expect("quota state lock poisoned");
-                
+
                 // Assign current to the result from quota_map or default
-                quota_map
-                    .get(&caller_pubkey)
-                    .cloned()
-                    .unwrap_or(RateState {
-                        balance: quota_rule.max_capacity,
-                        last_refill_micros: now,
-                    })
+                quota_map.get(&caller_pubkey).cloned().unwrap_or(RateState {
+                    balance: quota_rule.max_capacity,
+                    last_refill_micros: now,
+                })
             };
 
-            let elapsed = now.saturating_sub(current.last_refill_micros);
-            let added = quota_rule.rate_per_micro.saturating_mul(elapsed);
-            let forecasted = current
-                .balance
-                .saturating_add(added)
-                .min(quota_rule.max_capacity);
-
-            if forecasted < amount_msat {
-                return Err(quota_exceeded_response(&request.method));
-            }
+            let new_value = calculate_forecast(&amount_msat, &now, &current, quota_rule)
+                .map_err(|_| quota_exceeded_response(&request.method))?;
 
             let new_state = RateState {
-                balance: forecasted.saturating_sub(amount_msat),
+                balance: new_value,
                 last_refill_micros: now,
             };
             quota_update = Some((current, new_state));
@@ -825,7 +823,7 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
 
 async fn process_nwc_request(request: Request, event: &Event) -> Response {
     // Check that the user is authorized
-    if let Err(response) = verify_access_new_new(&request, event) {
+    if let Err(response) = verify_access(&request, event) {
         return response;
     }
 
@@ -854,7 +852,11 @@ async fn process_nwc_request(request: Request, event: &Event) -> Response {
     }
 
     // Execute the request
-    handler.execute(&request, &event.pubkey.to_string()).unwrap()
+    handler
+        .execute(&request, &event.pubkey.to_string())
+        .unwrap()
+
+    // Account
 }
 
 fn allowed_methods_for(caller_pubkey: &str) -> Vec<Method> {
