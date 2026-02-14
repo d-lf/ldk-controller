@@ -31,6 +31,17 @@ struct QuotaState {
     last_refill_micros: u64,
 }
 
+struct RateState {
+    balance: u64,
+    last_refill_micros: u64,
+}
+
+struct AccessState {
+    access_rate: RwLock<HashMap<(String, Method), RateState>>,   // per‑method access rate
+    quota: RwLock<HashMap<String, RateState>>,            // per‑user quota rate
+}
+
+static ACCESS_STATE: OnceLock<AccessState> = OnceLock::new();
 
 static ACCESS: OnceLock<RwLock<HashMap<String, HashMap<Method, AccessRule>>>> = OnceLock::new();
 static QUOTAS: OnceLock<RwLock<HashMap<String, QuotaState>>> = OnceLock::new();
@@ -57,6 +68,13 @@ fn access() -> &'static RwLock<HashMap<String, HashMap<Method, AccessRule>>> {
 
 fn quotas() -> &'static RwLock<HashMap<String, QuotaState>> {
     QUOTAS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn access_state() -> &'static AccessState {
+    ACCESS_STATE.get_or_init(|| AccessState {
+        access_rate: RwLock::new(HashMap::new()),
+        quota: RwLock::new(HashMap::new()),
+    })
 }
 
 pub fn set_access_rule(pubkey: &str, method: Method, rate_per_micro: u64, capacity: u64) {
