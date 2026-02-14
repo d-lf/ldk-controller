@@ -127,24 +127,34 @@ Steps:
 
 #### Enforcing the User Profile
 
-The node enforces the `UsageProfile` in the following order (fail-first):
+##### Step 1: Resolve the Grant
 
 1. Resolve the caller's latest `UsageProfile` grant (kind `30078`) for `d = relay_pubkey:user_pubkey`. If missing, deny
    access with `UNAUTHORIZED`.
 2. Parse the grant content as `UsageProfile`. If parsing fails, deny access with `UNAUTHORIZED`.
-3. Read `methods`.
-    1. If `methods` does not exist, treat it as no restriction on methods, proceed to 4.
-    2. If `methods` is present and is empty, deny access with `RESTRICTED`.
-    3. If `methods` is present and the requested method is missing, deny access with `RESTRICTED`.
-    4. Read the rate limit rule for the requested method.
-        1. If missing, no rate limit is applied, proceed to 4.
-        2. If present, forecast current rate quota and then check rate limit, if above the limit, deny access with
-           `RATE_LIMITED`.
-4. Read `quota`.
-    1. If `quota` is missing or method does not spend, treat it as no spending quota limit, proceed.
-    2. If `quota` is present, forecast current spending quota and then check against the spending quota limit, if above
-       the limit, deny access with `QUOTA_EXCEEDED`.
-5. Grant access.
+
+##### Step 2: Method Authorization
+
+1. Read `methods`. If `methods` does not exist, treat it as no restriction on methods and proceed.
+2. If `methods` is present and empty, deny access with `RESTRICTED`.
+3. If `methods` is present and the requested method is missing, deny access with `RESTRICTED`.
+
+##### Step 3: Rate Limit (only for permitted methods)
+
+1. Read the rate limit rule for the requested method.
+2. If missing, no rate limit is applied and proceed.
+3. If present, forecast current rate quota and check the rate limit. If above the limit, deny access with
+   `RATE_LIMITED`.
+
+##### Step 4: Quota
+
+1. Read `quota`. If `quota` is missing or the method does not spend, treat it as no spending quota limit and proceed.
+2. If `quota` is present, forecast current spending quota and check against the spending quota limit. If above the
+   limit, deny access with `QUOTA_EXCEEDED`.
+
+##### Step 5: Grant Access
+
+1. Grant access.
 
 ### Error Behavior
 
