@@ -32,6 +32,7 @@ struct QuotaState {
     last_refill_micros: u64,
 }
 
+#[derive(Clone)]
 struct RateState {
     balance: u64,
     last_refill_micros: u64,
@@ -308,12 +309,159 @@ fn verify_access_new(request: &Request, event: &Event) -> Result<(), Response> {
     Ok(())
 }
 
+fn verify_access_new_new(request: &Request, event: &Event) -> Result<(), Response> {
+    let caller_pubkey = event.pubkey.to_string();
+
+    // Owners bypass all access checks.
+    if owners_contains(&caller_pubkey) {
+        return Ok(());
+    }
+
+    // Require a UsageProfile grant for the caller.
+    let profile = {
+        let map = usage_profiles()
+            .read()
+            .expect("usage profile map lock poisoned");
+        map.get(&caller_pubkey).cloned()
+    };
+    let profile = profile.ok_or_else(|| unauthorized_response(&request.method))?;
+
+    // Method authorization: missing methods means no restriction.
+    let method_rule = match &profile.methods {
+        None => None,
+        Some(methods) => {
+            if methods.is_empty() {
+                return Err(access_denied_response(&request.method));
+            }
+            match methods.get(&request.method) {
+                Some(rule) => Some(rule.clone()),
+                None => return Err(access_denied_response(&request.method)),
+            }
+        }
+    };
+
+    let now = now_micros();
+
+    // Prepare rate limit state updates, but only apply if all checks pass.
+    let mut rate_update: Option<(RateState, RateState)> = None;
+    
+    
+    if let Some(rule) = method_rule.as_ref().and_then(|r| r.access_rate.as_ref()) {
+        let key = (caller_pubkey.clone(), request.method.clone());
+
+        let current = {
+            let access_rates = access_state()
+                .access_rate
+                .read()
+                .expect("access state rate lock poisoned");
+            access_rates
+                .get(&key)
+                .cloned()
+                .unwrap_or(RateState {
+                    balance: rule.max_capacity,
+                    last_refill_micros: now,
+                })
+        };
+
+        let elapsed = now.saturating_sub(current.last_refill_micros);
+        let added = rule.rate_per_micro.saturating_mul(elapsed);
+        let forecasted = current
+            .balance
+            .saturating_add(added)
+            .min(rule.max_capacity);
+
+        // check if we are below the rate
+        if forecasted < 1_000_000 {
+            return Err(rate_limited_response(&request.method));
+        }
+
+        // This is the new state
+        let new_state = RateState {
+            balance: forecasted.saturating_sub(1_000_000),
+            last_refill_micros: now,
+        };
+
+        rate_update = Some((current, new_state));
+    }
+
+    // Prepare quota updates. Only apply if the request spends msats.
+    let amount_msat = request_spend_msat(request).unwrap_or(0);
+    let mut quota_update: Option<(RateState, RateState)> = None;
+    if amount_msat > 0 {
+        if let Some(quota_rule) = profile.quota.as_ref() {
+            let current = {
+                let quota_map = access_state()
+                    .quota
+                    .read()
+                    .expect("quota state lock poisoned");
+                
+                // Assign current to the result from quota_map or default
+                quota_map
+                    .get(&caller_pubkey)
+                    .cloned()
+                    .unwrap_or(RateState {
+                        balance: quota_rule.max_capacity,
+                        last_refill_micros: now,
+                    })
+            };
+
+            let elapsed = now.saturating_sub(current.last_refill_micros);
+            let added = quota_rule.rate_per_micro.saturating_mul(elapsed);
+            let forecasted = current
+                .balance
+                .saturating_add(added)
+                .min(quota_rule.max_capacity);
+
+            if forecasted < amount_msat {
+                return Err(quota_exceeded_response(&request.method));
+            }
+
+            let new_state = RateState {
+                balance: forecasted.saturating_sub(amount_msat),
+                last_refill_micros: now,
+            };
+            quota_update = Some((current, new_state));
+        }
+    }
+
+    // Apply rate and quota updates after all checks pass.
+    if let Some((_, new_state)) = rate_update {
+        let mut access_rate = access_state()
+            .access_rate
+            .write()
+            .expect("access state rate lock poisoned");
+        let key = (caller_pubkey.clone(), request.method.clone());
+        access_rate.insert(key, new_state);
+    }
+
+    if let Some((_, new_state)) = quota_update {
+        let mut quota_map = access_state()
+            .quota
+            .write()
+            .expect("quota state lock poisoned");
+        quota_map.insert(caller_pubkey.clone(), new_state);
+    }
+
+    Ok(())
+}
+
 fn access_denied_response(method: &Method) -> Response {
     Response {
         result_type: method.clone(),
         error: Some(NIP47Error {
             code: ErrorCode::Restricted,
             message: "access denied, insufficient permission".to_string(),
+        }),
+        result: None,
+    }
+}
+
+fn unauthorized_response(method: &Method) -> Response {
+    Response {
+        result_type: method.clone(),
+        error: Some(NIP47Error {
+            code: ErrorCode::Unauthorized,
+            message: "unauthorized".to_string(),
         }),
         result: None,
     }
@@ -893,7 +1041,7 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
 
 async fn process_nwc_request(request: Request, event: &Event) -> Response {
     // Check that the user is authorized
-    if let Err(response) = verify_access(&request, event) {
+    if let Err(response) = verify_access_new_new(&request, event) {
         return response;
     }
 
@@ -922,7 +1070,49 @@ async fn process_nwc_request(request: Request, event: &Event) -> Response {
     }
 
     // Execute the request
-    handler.execute(&request).unwrap()
+    let mut response = handler.execute(&request).unwrap();
+
+    // Filter get_info methods to those the caller can access.
+    if response.result_type == Method::GetInfo {
+        if let Some(ResponseResult::GetInfo(info)) = response.result.as_mut() {
+            let caller_pubkey = event.pubkey.to_string();
+            info.methods = allowed_methods_for(&caller_pubkey);
+        }
+    }
+
+    response
+}
+
+fn allowed_methods_for(caller_pubkey: &str) -> Vec<Method> {
+    if owners_contains(caller_pubkey) {
+        return SUPPORTED_METHODS.to_vec();
+    }
+
+    let profile = {
+        let map = usage_profiles()
+            .read()
+            .expect("usage profile map lock poisoned");
+        map.get(caller_pubkey).cloned()
+    };
+
+    let Some(profile) = profile else {
+        return Vec::new();
+    };
+
+    match profile.methods {
+        None => SUPPORTED_METHODS.to_vec(),
+        Some(methods) => {
+            if methods.is_empty() {
+                Vec::new()
+            } else {
+                SUPPORTED_METHODS
+                    .iter()
+                    .filter(|m| methods.contains_key(m))
+                    .cloned()
+                    .collect()
+            }
+        }
+    }
 }
 
 async fn handle_nwc_request(
