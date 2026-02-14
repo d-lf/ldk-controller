@@ -1178,6 +1178,7 @@ dependencies = [
  "nostr-sdk",
  "nwc",
  "serde",
+ "serde_json",
  "testcontainers",
  "tokio",
  "toml",

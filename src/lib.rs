@@ -9,6 +9,9 @@ use nwc::nostr::nips::nip47::{
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+pub mod usage_profile;
+
+pub use usage_profile::{MethodAccessRule, RateLimitRule, UsageProfile};
 
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
 static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
@@ -27,6 +30,7 @@ struct QuotaState {
     refill_per_micro: u64,
     last_refill_micros: u64,
 }
+
 
 static ACCESS: OnceLock<RwLock<HashMap<String, HashMap<Method, AccessRule>>>> = OnceLock::new();
 static QUOTAS: OnceLock<RwLock<HashMap<String, QuotaState>>> = OnceLock::new();
