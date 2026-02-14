@@ -202,6 +202,62 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     Ok(())
 }
 
+fn verify_access_new(request: &Request, event: &Event) -> Result<(), Response> {
+    let caller_pubkey = event.pubkey.to_string();
+
+    // Owners bypass all access checks and limits.
+    if owners_contains(&caller_pubkey) {
+        return Ok(());
+    }
+
+    // Require an existing rate state for this caller+method. Do not create it here.
+    let access_state = access_state();
+    let key = (caller_pubkey.clone(), request.method.clone());
+    let mut access_rate = access_state
+        .access_rate
+        .write()
+        .expect("access state rate lock poisoned");
+    let rate_state = access_rate
+        .get_mut(&key)
+        .ok_or_else(|| access_denied_response(&request.method))?;
+
+    // If this request spends msats, enforce quota before touching rate.
+    let amount_msat = request_spend_msat(request);
+    if let Some(amount_msat) = amount_msat {
+        // If the request explicitly spends 0, skip quota checks entirely.
+        if amount_msat == 0 {
+            // No quota impact.
+        } else {
+            // Require an existing quota state for this caller. Do not create it here.
+            let mut quota_map = access_state
+                .quota
+                .write()
+                .expect("quota state lock poisoned");
+            let quota_state = quota_map
+                .get_mut(&caller_pubkey)
+                .ok_or_else(|| access_denied_response(&request.method))?;
+
+            // Fail fast if the quota balance cannot cover the spend.
+            if quota_state.balance < amount_msat {
+                return Err(quota_exceeded_response(&request.method));
+            }
+
+            // Apply the quota consumption only after all quota checks pass.
+            quota_state.balance -= amount_msat;
+        }
+    }
+
+    // Fail fast if the rate balance cannot cover a single request token.
+    if rate_state.balance < 1_000_000 {
+        return Err(rate_limited_response(&request.method));
+    }
+
+    // Apply the rate consumption only after all checks pass.
+    rate_state.balance -= 1_000_000;
+
+    Ok(())
+}
+
 fn access_denied_response(method: &Method) -> Response {
     Response {
         result_type: method.clone(),
