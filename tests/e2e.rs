@@ -1,7 +1,7 @@
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip47::{
     CancelHoldInvoiceRequest, ListTransactionsRequest, LookupInvoiceRequest, MakeHoldInvoiceRequest,
-    MakeInvoiceRequest, Method, NostrWalletConnectUri,
+    Method, NostrWalletConnectUri,
     Request, RequestParams, Response, ResponseResult, SettleHoldInvoiceRequest,
 };
 use std::time::Duration;
@@ -31,86 +31,7 @@ use common::{start_relay, test_guard};
 // test_nwc_pay_keysend_roundtrip moved to tests/nwc_pay_keysend_roundtrip.rs
 
 
-/// End-to-end test: send a NWC make_invoice request, expect a valid response.
-#[tokio::test]
-async fn test_nwc_make_invoice_roundtrip() -> Result<()> {
-    let _guard = test_guard();
-    let (_container, relay_url) = start_relay().await;
-
-    let service_keys = Keys::generate();
-    let service_pubkey = service_keys.public_key();
-    let _service_client =
-        ldk_controller::run_nwc_service(service_keys, &relay_url).await?;
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let client_secret = Keys::generate().secret_key().clone();
-    let relay = RelayUrl::parse(&relay_url)?;
-    let uri = NostrWalletConnectUri::new(
-        service_pubkey,
-        vec![relay],
-        client_secret.clone(),
-        None,
-    );
-
-    let client_keys = Keys::new(client_secret);
-    let client_pubkey = client_keys.public_key().to_string();
-    ldk_controller::set_owners(vec![client_pubkey.clone()]);
-    let nwc_client = Client::builder().signer(client_keys).build();
-    nwc_client.add_relay(&relay_url).await?;
-    nwc_client.connect().await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let filter = Filter::new()
-        .kind(Kind::WalletConnectResponse)
-        .author(service_pubkey);
-    nwc_client.subscribe(filter).await?;
-
-    let params = MakeInvoiceRequest {
-        amount: 1,
-        description: None,
-        description_hash: None,
-        expiry: None,
-    };
-    let request_event = Request::make_invoice(params)
-        .to_event(&uri)
-        .expect("Failed to create NWC request event");
-    nwc_client.send_event(&request_event).await?;
-    println!("Sent NWC make_invoice request, waiting for response...");
-
-    let timeout = Duration::from_secs(10);
-    let uri_clone = uri.clone();
-    let result = tokio::time::timeout(timeout, async {
-        let mut notifications = nwc_client.notifications();
-        while let Some(notification) = notifications.next().await {
-            if let ClientNotification::Event { event, .. } = notification {
-                let event = event.as_ref();
-                if event.kind == Kind::WalletConnectResponse && event.pubkey == service_pubkey {
-                    let response = Response::from_event(&uri_clone, event)
-                        .expect("Failed to decrypt NWC response");
-
-                    let invoice = response
-                        .to_make_invoice()
-                        .expect("Response was not a valid make_invoice");
-
-                    assert_eq!(invoice.invoice, "dummy_invoice");
-                    break;
-                }
-            }
-        }
-        Ok::<(), nostr_sdk::client::Error>(())
-    })
-    .await;
-
-    match result {
-        Ok(Ok(())) => {
-            println!("NWC make_invoice roundtrip test passed!");
-            Ok(())
-        }
-        Ok(Err(e)) => panic!("Notification handler error: {}", e),
-        Err(_) => panic!("Timeout: did not receive NWC response within 10 seconds"),
-    }
-}
+// test_nwc_make_invoice_roundtrip moved to tests/nwc_make_invoice_roundtrip.rs
 
 /// End-to-end test: send a NWC lookup_invoice request, expect a valid response.
 #[tokio::test]
