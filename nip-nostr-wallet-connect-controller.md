@@ -139,7 +139,7 @@ Steps:
 2. If `methods` is present and empty, deny access with `RESTRICTED`.
 3. If `methods` is present and the requested method is missing, deny access with `RESTRICTED`.
 
-##### Step 3: Rate Limit (only for permitted methods)
+##### Step 3: Rate Limit (only if methods are restricted)
 
 1. Read the rate limit rule for the requested method.
 2. If missing, no rate limit is applied and proceed.
