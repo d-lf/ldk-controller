@@ -96,16 +96,32 @@ fn upsert_usage_profile(target_pubkey: &str, profile: UsageProfile) {
     map.insert(target_pubkey.to_string(), profile);
 }
 
-fn calculate_forecast(
+fn calculate_new_state<K>(
+    map: &RwLock<HashMap<K, RateState>>,
+    key: &K,
     amount: &u64,
     now: &u64,
-    current: &RateState,
     rule: &RateLimitRule,
-) -> Result<u64, String> {
+) -> Result<RateState, String>
+where
+    K: Eq,
+    K: std::hash::Hash,
+{
+    let current = map
+        .read()
+        .expect("rate limit state lock poisoned")
+        .get(key)
+        .cloned()
+        .unwrap_or(RateState {
+            balance: rule.max_capacity,
+            last_refill_micros: *now,
+        });
+
     let elapsed = now.saturating_sub(current.last_refill_micros);
     let added = rule.rate_per_micro.saturating_mul(elapsed);
     let forecasted = current.balance.saturating_add(added).min(rule.max_capacity);
 
+    // Validate that we are not out of quota
     if forecasted < *amount {
         return Err(format!(
             "forecasted balance {} is less than amount {}",
@@ -113,11 +129,36 @@ fn calculate_forecast(
         ));
     }
 
-    Ok(forecasted.saturating_sub(*amount))
+    let new_state = RateState {
+        balance: forecasted.saturating_sub(*amount),
+        last_refill_micros: *now,
+    };
+
+    Ok(new_state)
+}
+
+type Deferred = Box<dyn FnOnce() + Send>;
+
+fn defer_update<K>(
+    map: &'static RwLock<HashMap<K, RateState>>,
+    key: K,
+    new_state: RateState,
+    deferred: &mut Vec<Deferred>,
+) where
+    K: Eq + std::hash::Hash + Send + Sync + 'static,
+{
+    deferred.push(Box::new(move || {
+        map.write()
+            .expect("access state lock poisoned")
+            .insert(key, new_state);
+    }));
 }
 
 fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     let caller_pubkey = event.pubkey.to_string();
+
+    // type Deferred = Box<dyn FnOnce() + Send>;
+    let mut deferred: Vec<Deferred> = Vec::new();
 
     // Require a UsageProfile grant for the caller.
     let profile = {
@@ -145,82 +186,33 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     let now = now_micros();
 
     // Prepare rate limit state updates, but only apply if all checks pass.
-    let mut rate_update: Option<(RateState, RateState)> = None;
-
     if let Some(rule) = method_rule.as_ref().and_then(|r| r.access_rate.as_ref()) {
+        let map = &access_state().access_rate;
         let key = (caller_pubkey.clone(), request.method.clone());
-
-        // Get the current state of the access_rate
-        let current = {
-            let access_rates = access_state()
-                .access_rate
-                .read()
-                .expect("access state rate lock poisoned");
-            access_rates.get(&key).cloned().unwrap_or(RateState {
-                balance: rule.max_capacity,
-                last_refill_micros: now,
-            })
-        };
-
         let amount = 1_000_000;
 
-        let new_value = calculate_forecast(&amount, &now, &current, rule)
+        // Calculate a new state if you fail, fail fast.
+        let new_state = calculate_new_state(map, &key, &amount, &now, rule)
             .map_err(|_| rate_limited_response(&request.method))?;
 
-        // This is the new state
-        let new_state = RateState {
-            balance: new_value,
-            last_refill_micros: now,
-        };
-
-        rate_update = Some((current, new_state));
+        defer_update(map, key, new_state, &mut deferred);
     }
 
     // Prepare quota updates. Only apply if the request spends msats.
     let amount_msat = request_spend_msat(request).unwrap_or(0);
-    let mut quota_update: Option<(RateState, RateState)> = None;
     if amount_msat > 0 {
-        if let Some(quota_rule) = profile.quota.as_ref() {
-            let current = {
-                let quota_map = access_state()
-                    .quota
-                    .read()
-                    .expect("quota state lock poisoned");
-
-                // Assign current to the result from quota_map or default
-                quota_map.get(&caller_pubkey).cloned().unwrap_or(RateState {
-                    balance: quota_rule.max_capacity,
-                    last_refill_micros: now,
-                })
-            };
-
-            let new_value = calculate_forecast(&amount_msat, &now, &current, quota_rule)
+        if let Some(rule) = profile.quota.as_ref() {
+            let map = &access_state().quota;
+            let key = caller_pubkey.clone();
+            let new_state = calculate_new_state(map, &key, &amount_msat, &now, rule)
                 .map_err(|_| quota_exceeded_response(&request.method))?;
 
-            let new_state = RateState {
-                balance: new_value,
-                last_refill_micros: now,
-            };
-            quota_update = Some((current, new_state));
+            defer_update(map, key, new_state, &mut deferred);
         }
     }
 
-    // Apply rate and quota updates after all checks pass.
-    if let Some((_, new_state)) = rate_update {
-        let mut access_rate = access_state()
-            .access_rate
-            .write()
-            .expect("access state rate lock poisoned");
-        let key = (caller_pubkey.clone(), request.method.clone());
-        access_rate.insert(key, new_state);
-    }
-
-    if let Some((_, new_state)) = quota_update {
-        let mut quota_map = access_state()
-            .quota
-            .write()
-            .expect("quota state lock poisoned");
-        quota_map.insert(caller_pubkey.clone(), new_state);
+    for deferred_function in deferred {
+        deferred_function();
     }
 
     Ok(())
