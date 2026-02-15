@@ -6,9 +6,11 @@ use nwc::nostr::nips::nip47::{
     PayInvoiceResponse, PayKeysendResponse, Request, RequestParams, Response, ResponseResult,
     SettleHoldInvoiceResponse, TransactionState, TransactionType,
 };
+use crate::state::rate_state::RateState;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+mod state;
 pub mod usage_profile;
 
 pub use usage_profile::{MethodAccessRule, RateLimitRule, UsageProfile};
@@ -16,12 +18,6 @@ pub use usage_profile::{MethodAccessRule, RateLimitRule, UsageProfile};
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
 static RELAY_PUBKEY: OnceLock<PublicKey> = OnceLock::new();
 static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
-
-#[derive(Clone)]
-struct RateState {
-    balance: u64,
-    last_refill_micros: u64,
-}
 
 struct AccessState {
     access_rate: RwLock<HashMap<(String, Method), RateState>>, // per‑method access rate
@@ -100,41 +96,27 @@ fn calculate_new_state<K>(
     map: &RwLock<HashMap<K, RateState>>,
     key: &K,
     amount: &u64,
-    now: &u64,
+    now: u64,
     rule: &RateLimitRule,
 ) -> Result<RateState, String>
 where
     K: Eq,
     K: std::hash::Hash,
 {
-    let current = map
+    let mut cloned_current_state = map
         .read()
         .expect("rate limit state lock poisoned")
         .get(key)
         .cloned()
-        .unwrap_or(RateState {
-            balance: rule.max_capacity,
-            last_refill_micros: *now,
-        });
+        .unwrap_or(RateState::from_rule(now, rule));
 
-    let elapsed = now.saturating_sub(current.last_refill_micros);
-    let added = rule.rate_per_micro.saturating_mul(elapsed);
-    let forecasted = current.balance.saturating_add(added).min(rule.max_capacity);
-
-    // Validate that we are not out of quota
-    if forecasted < *amount {
-        return Err(format!(
-            "forecasted balance {} is less than amount {}",
-            forecasted, amount
-        ));
+    
+    cloned_current_state.refill(now, rule);
+    
+    match cloned_current_state.withdraw(*amount) {
+        Ok(_) => { Ok(cloned_current_state) }
+        Err(_) => { Err(format!("withdraw failed for amount {}", amount)) }
     }
-
-    let new_state = RateState {
-        balance: forecasted.saturating_sub(*amount),
-        last_refill_micros: *now,
-    };
-
-    Ok(new_state)
 }
 
 type Deferred = Box<dyn FnOnce() + Send>;
@@ -192,7 +174,7 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
         let amount = 1_000_000;
 
         // Calculate a new state if you fail, fail fast.
-        let new_state = calculate_new_state(map, &key, &amount, &now, rule)
+        let new_state = calculate_new_state(map, &key, &amount, now, rule)
             .map_err(|_| rate_limited_response(&request.method))?;
 
         defer_update(map, key, new_state, &mut deferred);
@@ -204,7 +186,7 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
         if let Some(rule) = profile.quota.as_ref() {
             let map = &access_state().quota;
             let key = caller_pubkey.clone();
-            let new_state = calculate_new_state(map, &key, &amount_msat, &now, rule)
+            let new_state = calculate_new_state(map, &key, &amount_msat, now, rule)
                 .map_err(|_| quota_exceeded_response(&request.method))?;
 
             defer_update(map, key, new_state, &mut deferred);
