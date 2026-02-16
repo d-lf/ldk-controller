@@ -1,4 +1,5 @@
 use crate::state::rate_state::RateState;
+use crate::state::store::access_store::access_state;
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
@@ -28,12 +29,6 @@ static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
 static RELAY_PUBKEY: OnceLock<PublicKey> = OnceLock::new();
 static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 
-struct AccessState {
-    access_rate: RwLock<HashMap<AccessKey, RateState>>, // per‑method access rate
-    quota: RwLock<HashMap<AccessKey, RateState>>,                 // per‑user quota rate
-}
-
-static ACCESS_STATE: OnceLock<AccessState> = OnceLock::new();
 static USAGE_PROFILES: OnceLock<RwLock<HashMap<String, UsageProfile>>> = OnceLock::new();
 
 fn set_global_keys(keys: &Keys) {
@@ -48,13 +43,6 @@ pub fn set_owners(owners: Vec<String>) {
     let lock = OWNERS.get_or_init(|| RwLock::new(Vec::new()));
     let mut guard = lock.write().expect("owners lock poisoned");
     *guard = owners;
-}
-
-fn access_state() -> &'static AccessState {
-    ACCESS_STATE.get_or_init(|| AccessState {
-        access_rate: RwLock::new(HashMap::new()),
-        quota: RwLock::new(HashMap::new()),
-    })
 }
 
 fn usage_profiles() -> &'static RwLock<HashMap<String, UsageProfile>> {
@@ -95,7 +83,7 @@ fn parse_grant_target(event: &Event) -> Option<String> {
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
-enum AccessKey {
+pub(crate) enum AccessKey {
     Method { pubkey: String, method: Method },
     Quota { pubkey: String },
 }
