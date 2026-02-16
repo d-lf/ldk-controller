@@ -1,3 +1,4 @@
+use crate::state::rate_state::RateState;
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
@@ -6,22 +7,30 @@ use nwc::nostr::nips::nip47::{
     PayInvoiceResponse, PayKeysendResponse, Request, RequestParams, Response, ResponseResult,
     SettleHoldInvoiceResponse, TransactionState, TransactionType,
 };
-use crate::state::rate_state::RateState;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+pub mod rate_limit_rule;
 mod state;
 pub mod usage_profile;
 
-pub use usage_profile::{MethodAccessRule, RateLimitRule, UsageProfile};
+pub use rate_limit_rule::RateLimitRule;
+pub use state::rate_state::RateStateError;
+pub use usage_profile::{MethodAccessRule, UsageProfile};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessErrorContext {
+    AccessRate,
+    Quota,
+}
 
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
 static RELAY_PUBKEY: OnceLock<PublicKey> = OnceLock::new();
 static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 
 struct AccessState {
-    access_rate: RwLock<HashMap<(String, Method), RateState>>, // per‑method access rate
-    quota: RwLock<HashMap<String, RateState>>,                 // per‑user quota rate
+    access_rate: RwLock<HashMap<AccessKey, RateState>>, // per‑method access rate
+    quota: RwLock<HashMap<AccessKey, RateState>>,                 // per‑user quota rate
 }
 
 static ACCESS_STATE: OnceLock<AccessState> = OnceLock::new();
@@ -85,6 +94,20 @@ fn parse_grant_target(event: &Event) -> Option<String> {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Hash, Clone)]
+enum AccessKey {
+    Method { pubkey: String, method: Method },
+    Quota { pubkey: String },
+}
+
+struct AccessLock<'a> {
+    map: &'a RwLock<HashMap<AccessKey, RateState>>,
+    key: AccessKey,
+    rule: RateLimitRule,
+    amount: u64,
+    error: AccessErrorContext,
+}
+
 fn upsert_usage_profile(target_pubkey: &str, profile: UsageProfile) {
     let mut map = usage_profiles()
         .write()
@@ -98,7 +121,7 @@ fn calculate_new_state<K>(
     amount: &u64,
     now: u64,
     rule: &RateLimitRule,
-) -> Result<RateState, String>
+) -> Result<RateState, RateStateError>
 where
     K: Eq,
     K: std::hash::Hash,
@@ -108,15 +131,12 @@ where
         .expect("rate limit state lock poisoned")
         .get(key)
         .cloned()
-        .unwrap_or(RateState::from_rule(now, rule));
+        .unwrap_or(RateState::from_rule(now, rule)?);
 
-    
-    cloned_current_state.refill(now, rule);
-    
-    match cloned_current_state.withdraw(*amount) {
-        Ok(_) => { Ok(cloned_current_state) }
-        Err(_) => { Err(format!("withdraw failed for amount {}", amount)) }
-    }
+    cloned_current_state.refill(now, rule)?;
+    cloned_current_state.withdraw(*amount)?;
+
+    Ok(cloned_current_state)
 }
 
 type Deferred = Box<dyn FnOnce() + Send>;
@@ -135,6 +155,51 @@ fn defer_update<K>(
             .insert(key, new_state);
     }));
 }
+
+// fn update_usage(request: &Request, event: &Event) -> Result<(), Response> {
+//     let caller_pubkey = event.pubkey.to_string();
+//
+//     // Require a UsageProfile grant for the caller.
+//     let profile = {
+//         let map = usage_profiles()
+//             .read()
+//             .expect("usage profile map lock poisoned");
+//         map.get(&caller_pubkey).cloned()
+//     };
+//     let profile = profile.ok_or_else(|| unauthorized_response(&request.method))?;
+//
+//     // Method authorization: missing methods means no restriction.
+//     let method_rule = match &profile.methods {
+//         None => None,
+//         Some(methods) => {
+//             if methods.is_empty() {
+//                 return Err(access_denied_response(&request.method));
+//             }
+//             match methods.get(&request.method) {
+//                 Some(rule) => Some(rule.clone()),
+//                 None => return Err(access_denied_response(&request.method)),
+//             }
+//         }
+//     };
+//
+//     let now = now_micros();
+//
+//     // Prepare rate limit state updates, but only apply if all checks pass.
+//     if let Some(rule) = method_rule.as_ref().and_then(|r| r.access_rate.as_ref()) {
+//         let map = &access_state().access_rate;
+//         let key = (caller_pubkey.clone(), request.method.clone());
+//         let amount = 1_000_000;
+//
+//         // Calculate a new state if you fail, fail fast.
+//         let new_state = calculate_new_state(map, &key, &amount, now, rule)
+//             .map_err(|e| rate_state_error_response(&request.method, &e, AccessErrorContext::AccessRate))?;
+//
+//         // Ok here we add things to things.
+//     }
+//
+//
+//     Ok(())
+// }
 
 fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     let caller_pubkey = event.pubkey.to_string();
@@ -167,35 +232,92 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
 
     let now = now_micros();
 
+    let mut locks: Vec<AccessLock<>>  = Vec::new();
+
     // Prepare rate limit state updates, but only apply if all checks pass.
     if let Some(rule) = method_rule.as_ref().and_then(|r| r.access_rate.as_ref()) {
-        let map = &access_state().access_rate;
-        let key = (caller_pubkey.clone(), request.method.clone());
+        // let map = &access_state().access_rate;
+        // let key = (caller_pubkey.clone(), request.method.clone());
         let amount = 1_000_000;
 
-        // Calculate a new state if you fail, fail fast.
-        let new_state = calculate_new_state(map, &key, &amount, now, rule)
-            .map_err(|_| rate_limited_response(&request.method))?;
+        let lock = AccessLock {
+            map: &access_state().access_rate,
+            key: AccessKey::Method {pubkey: caller_pubkey.clone(), method: request.method.clone()},
+            rule: rule.clone(),
+            amount,
+            error: AccessErrorContext::AccessRate
+        };
 
-        defer_update(map, key, new_state, &mut deferred);
+        locks.push(lock);
+
+        // Calculate a new state if you fail, fail fast.
+        // let new_state = calculate_new_state(&lock.map, &lock.key, &amount, now, rule).map_err(|e| {
+        //     rate_state_error_response(&request.method, &e, AccessErrorContext::AccessRate)
+        // })?;
+
+        // Ok here we add things to things.
+        // defer_update(&lock.map, lock.key, new_state, &mut deferred);
     }
 
     // Prepare quota updates. Only apply if the request spends msats.
     let amount_msat = request_spend_msat(request).unwrap_or(0);
     if amount_msat > 0 {
         if let Some(rule) = profile.quota.as_ref() {
-            let map = &access_state().quota;
-            let key = caller_pubkey.clone();
-            let new_state = calculate_new_state(map, &key, &amount_msat, now, rule)
-                .map_err(|_| quota_exceeded_response(&request.method))?;
+            // let map = &access_state().quota;
+            // let key = caller_pubkey.clone();
 
-            defer_update(map, key, new_state, &mut deferred);
+            let lock = AccessLock {
+                map: &access_state().quota,
+                key: AccessKey::Quota {pubkey: caller_pubkey.clone()},
+                rule: rule.clone(),
+                amount: amount_msat,
+                error: AccessErrorContext::Quota
+            };
+
+            locks.push(lock);
+
+            // let new_state =
+            //     calculate_new_state(map, &key, &amount_msat, now, rule).map_err(|e| {
+            //         rate_state_error_response(&request.method, &e, AccessErrorContext::Quota)
+            //     })?;
+            //
+            // defer_update(map, key, new_state, &mut deferred);
         }
     }
 
-    for deferred_function in deferred {
-        deferred_function();
+    for lock in &locks {
+
+        // We just check for errors here update will come later
+        let new_state =
+            calculate_new_state(lock.map, &lock.key, &lock.amount, now, &lock.rule).map_err(|e| {
+                rate_state_error_response(&request.method, &e, lock.error)
+            })?;
+
+        // defer_update(lock.map, lock.key, new_state, &mut deferred);
+        //
+        //     lock.map.write()
+        //         .expect("access state lock poisoned")
+        //         .insert(lock.key, new_state);
+
+
     }
+
+    for lock in locks {
+
+        let mut map = lock.map
+            .write()
+            .expect("rate limit state lock poisoned");
+
+
+        let state = map.entry(lock.key).or_insert(RateState::from_rule(now, &lock.rule).unwrap());
+
+        state.refill(now, &lock.rule).unwrap();
+        state.withdraw_force(lock.amount);
+    }
+
+    // for deferred_function in deferred {
+    //     deferred_function();
+    // }
 
     Ok(())
 }
@@ -240,6 +362,45 @@ fn quota_exceeded_response(method: &Method) -> Response {
             code: ErrorCode::QuotaExceeded,
             message: "quota exceeded".to_string(),
         }),
+        result: None,
+    }
+}
+
+pub fn map_rate_state_error(error: &RateStateError, context: AccessErrorContext) -> NIP47Error {
+    match error {
+        RateStateError::InsufficientBalance => {
+            let (code, message) = match context {
+                AccessErrorContext::AccessRate => (ErrorCode::RateLimited, "rate limit exceeded"),
+                AccessErrorContext::Quota => (ErrorCode::QuotaExceeded, "quota exceeded"),
+            };
+            NIP47Error {
+                code,
+                message: message.to_string(),
+            }
+        }
+        RateStateError::AmountTooLarge { .. } => NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid amount: exceeds i64::MAX".to_string(),
+        },
+        RateStateError::InvalidRule { .. } => NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid rate limit rule".to_string(),
+        },
+        RateStateError::InternalInvariantViolation => NIP47Error {
+            code: ErrorCode::Other,
+            message: "internal rate state error".to_string(),
+        },
+    }
+}
+
+fn rate_state_error_response(
+    method: &Method,
+    error: &RateStateError,
+    context: AccessErrorContext,
+) -> Response {
+    Response {
+        result_type: method.clone(),
+        error: Some(map_rate_state_error(error, context)),
         result: None,
     }
 }
