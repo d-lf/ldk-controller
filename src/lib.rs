@@ -1,5 +1,6 @@
 use crate::state::rate_state::RateState;
 use crate::state::store::access_store::access_state;
+use crate::usage_profile::upsert_usage_profile;
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
@@ -18,6 +19,7 @@ pub mod usage_profile;
 pub use rate_limit_rule::RateLimitRule;
 pub use state::rate_state::RateStateError;
 pub use usage_profile::{MethodAccessRule, UsageProfile};
+pub use usage_profile::{clear_usage_profiles, get_usage_profile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessErrorContext {
@@ -28,8 +30,6 @@ pub enum AccessErrorContext {
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
 static RELAY_PUBKEY: OnceLock<PublicKey> = OnceLock::new();
 static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
-
-static USAGE_PROFILES: OnceLock<RwLock<HashMap<String, UsageProfile>>> = OnceLock::new();
 
 fn set_global_keys(keys: &Keys) {
     let _ = GLOBAL_KEYS.set(keys.clone());
@@ -43,24 +43,6 @@ pub fn set_owners(owners: Vec<String>) {
     let lock = OWNERS.get_or_init(|| RwLock::new(Vec::new()));
     let mut guard = lock.write().expect("owners lock poisoned");
     *guard = owners;
-}
-
-fn usage_profiles() -> &'static RwLock<HashMap<String, UsageProfile>> {
-    USAGE_PROFILES.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-pub fn get_usage_profile(pubkey: &str) -> Option<UsageProfile> {
-    let map = usage_profiles()
-        .read()
-        .expect("usage profile map lock poisoned");
-    map.get(pubkey).cloned()
-}
-
-pub fn clear_usage_profiles() {
-    let mut map = usage_profiles()
-        .write()
-        .expect("usage profile map lock poisoned");
-    map.clear();
 }
 
 fn parse_grant_target(event: &Event) -> Option<String> {
@@ -94,13 +76,6 @@ struct AccessLock<'a> {
     rule: RateLimitRule,
     amount: u64,
     error: AccessErrorContext,
-}
-
-fn upsert_usage_profile(target_pubkey: &str, profile: UsageProfile) {
-    let mut map = usage_profiles()
-        .write()
-        .expect("usage profile map lock poisoned");
-    map.insert(target_pubkey.to_string(), profile);
 }
 
 fn calculate_new_state<K>(
@@ -196,12 +171,7 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     let mut deferred: Vec<Deferred> = Vec::new();
 
     // Require a UsageProfile grant for the caller.
-    let profile = {
-        let map = usage_profiles()
-            .read()
-            .expect("usage profile map lock poisoned");
-        map.get(&caller_pubkey).cloned()
-    };
+    let profile = get_usage_profile(&caller_pubkey);
     let profile = profile.ok_or_else(|| unauthorized_response(&request.method))?;
 
     // Method authorization: missing methods means no restriction.
@@ -983,12 +953,7 @@ async fn process_nwc_request(request: Request, event: &Event) -> Response {
 }
 
 fn allowed_methods_for(caller_pubkey: &str) -> Vec<Method> {
-    let profile = {
-        let map = usage_profiles()
-            .read()
-            .expect("usage profile map lock poisoned");
-        map.get(caller_pubkey).cloned()
-    };
+    let profile = get_usage_profile(caller_pubkey);
 
     let Some(profile) = profile else {
         return Vec::new();
