@@ -1,5 +1,5 @@
 use crate::state::rate_state::RateState;
-use crate::state::store::access_store::access_state;
+use crate::state::store::{access_state, AccessKey};
 use crate::usage_profile::upsert_usage_profile;
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
@@ -19,7 +19,7 @@ pub mod usage_profile;
 pub use rate_limit_rule::RateLimitRule;
 pub use state::rate_state::RateStateError;
 pub use usage_profile::{MethodAccessRule, UsageProfile};
-pub use usage_profile::{clear_usage_profiles, get_usage_profile};
+pub use usage_profile::get_usage_profile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessErrorContext {
@@ -33,6 +33,86 @@ static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 
 fn set_global_keys(keys: &Keys) {
     let _ = GLOBAL_KEYS.set(keys.clone());
+}
+
+fn key_belongs_to_pubkey(key: &AccessKey, pubkey: &str) -> bool {
+    match key {
+        AccessKey::Method { pubkey: key_pubkey, .. } => key_pubkey == pubkey,
+        AccessKey::Quota { pubkey: key_pubkey } => key_pubkey == pubkey,
+    }
+}
+
+fn clear_states_for_pubkey(pubkey: &str) {
+    {
+        let mut map = access_state()
+            .access_rate
+            .write()
+            .expect("access_rate map lock poisoned");
+        map.retain(|key, _| !key_belongs_to_pubkey(key, pubkey));
+    }
+    {
+        let mut map = access_state()
+            .quota
+            .write()
+            .expect("quota map lock poisoned");
+        map.retain(|key, _| !key_belongs_to_pubkey(key, pubkey));
+    }
+}
+
+fn clear_all_access_states() {
+    access_state()
+        .access_rate
+        .write()
+        .expect("access_rate map lock poisoned")
+        .clear();
+    access_state()
+        .quota
+        .write()
+        .expect("quota map lock poisoned")
+        .clear();
+}
+
+fn initialize_states_for_profile(target_pubkey: &str, profile: &UsageProfile, now: u64) {
+    if let Some(methods) = profile.methods.as_ref() {
+        let mut map = access_state()
+            .access_rate
+            .write()
+            .expect("access_rate map lock poisoned");
+        for (method, method_rule) in methods {
+            if let Some(rule) = method_rule.access_rate.as_ref() {
+                if let Ok(state) = RateState::from_rule(now, rule) {
+                    map.insert(
+                        AccessKey::Method {
+                            pubkey: target_pubkey.to_string(),
+                            method: method.clone(),
+                        },
+                        state,
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(rule) = profile.quota.as_ref() {
+        if let Ok(state) = RateState::from_rule(now, rule) {
+            let mut map = access_state()
+                .quota
+                .write()
+                .expect("quota map lock poisoned");
+            map.insert(
+                AccessKey::Quota {
+                    pubkey: target_pubkey.to_string(),
+                },
+                state,
+            );
+        }
+    }
+}
+
+fn upsert_usage_profile_and_reset_states(target_pubkey: &str, profile: UsageProfile) {
+    clear_states_for_pubkey(target_pubkey);
+    initialize_states_for_profile(target_pubkey, &profile, now_micros());
+    upsert_usage_profile(target_pubkey, profile);
 }
 
 pub fn set_relay_pubkey(pubkey: PublicKey) {
@@ -64,10 +144,9 @@ fn parse_grant_target(event: &Event) -> Option<String> {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
-pub(crate) enum AccessKey {
-    Method { pubkey: String, method: Method },
-    Quota { pubkey: String },
+pub fn clear_usage_profiles() {
+    usage_profile::clear_usage_profiles();
+    clear_all_access_states();
 }
 
 struct AccessLock<'a> {
@@ -501,7 +580,7 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
                 for event in events.iter() {
                     if let Some(target_pubkey) = parse_grant_target(event) {
                         if let Ok(profile) = serde_json::from_str::<UsageProfile>(&event.content) {
-                            upsert_usage_profile(&target_pubkey, profile);
+                            upsert_usage_profile_and_reset_states(&target_pubkey, profile);
                         }
                     }
                 }
@@ -525,7 +604,7 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
                         if let Some(target_pubkey) = parse_grant_target(event) {
                             match serde_json::from_str::<UsageProfile>(&event.content) {
                                 Ok(profile) => {
-                                    upsert_usage_profile(&target_pubkey, profile);
+                                    upsert_usage_profile_and_reset_states(&target_pubkey, profile);
                                 }
                                 Err(e) => {
                                     eprintln!("Failed to parse UsageProfile: {}", e);
