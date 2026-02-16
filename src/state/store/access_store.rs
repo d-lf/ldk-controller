@@ -1,7 +1,7 @@
 use crate::state::rate_state::RateState;
 use nwc::nostr::nips::nip47::Method;
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub(crate) enum AccessKey {
@@ -10,8 +10,8 @@ pub(crate) enum AccessKey {
 }
 
 pub(crate) struct AccessState {
-    pub(crate) access_rate: RwLock<HashMap<AccessKey, RateState>>, // per-method access rate
-    pub(crate) quota: RwLock<HashMap<AccessKey, RateState>>,       // per-user quota rate
+    pub(crate) access_rate: RwLock<HashMap<AccessKey, Arc<Mutex<RateState>>>>, // per-method access rate
+    pub(crate) quota: RwLock<HashMap<AccessKey, Arc<Mutex<RateState>>>>, // per-user quota rate
 }
 
 static ACCESS_STATE: OnceLock<AccessState> = OnceLock::new();

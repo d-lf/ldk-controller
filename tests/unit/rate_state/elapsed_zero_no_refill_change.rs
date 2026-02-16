@@ -6,6 +6,8 @@ use crate::{rule, RateState};
 #[test]
 fn elapsed_zero_no_refill_change() {
     let mut state = RateState::new(42, 100);
-    state.refill(100, &rule(1000, 1_000_000)).expect("refill should work");
+    state
+        .refill(100, &rule(1000, 1_000_000))
+        .expect("refill should work");
     assert_eq!(state.balance(), 42);
 }

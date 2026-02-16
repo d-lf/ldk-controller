@@ -1,6 +1,5 @@
 use crate::state::rate_state::RateState;
 use crate::state::store::{access_state, AccessKey};
-use crate::usage_profile::upsert_usage_profile;
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
@@ -10,7 +9,7 @@ use nwc::nostr::nips::nip47::{
     SettleHoldInvoiceResponse, TransactionState, TransactionType,
 };
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod rate_limit_rule;
 mod state;
@@ -18,8 +17,8 @@ pub mod usage_profile;
 
 pub use rate_limit_rule::RateLimitRule;
 pub use state::rate_state::RateStateError;
-pub use usage_profile::{MethodAccessRule, UsageProfile};
 pub use usage_profile::get_usage_profile;
+pub use usage_profile::{MethodAccessRule, UsageProfile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessErrorContext {
@@ -30,89 +29,16 @@ pub enum AccessErrorContext {
 static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
 static RELAY_PUBKEY: OnceLock<PublicKey> = OnceLock::new();
 static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
+static APPLIED_GRANT_EVENTS: OnceLock<RwLock<HashMap<String, AppliedGrantEvent>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct AppliedGrantEvent {
+    created_at: u64,
+    event_id: String,
+}
 
 fn set_global_keys(keys: &Keys) {
     let _ = GLOBAL_KEYS.set(keys.clone());
-}
-
-fn key_belongs_to_pubkey(key: &AccessKey, pubkey: &str) -> bool {
-    match key {
-        AccessKey::Method { pubkey: key_pubkey, .. } => key_pubkey == pubkey,
-        AccessKey::Quota { pubkey: key_pubkey } => key_pubkey == pubkey,
-    }
-}
-
-fn clear_states_for_pubkey(pubkey: &str) {
-    {
-        let mut map = access_state()
-            .access_rate
-            .write()
-            .expect("access_rate map lock poisoned");
-        map.retain(|key, _| !key_belongs_to_pubkey(key, pubkey));
-    }
-    {
-        let mut map = access_state()
-            .quota
-            .write()
-            .expect("quota map lock poisoned");
-        map.retain(|key, _| !key_belongs_to_pubkey(key, pubkey));
-    }
-}
-
-fn clear_all_access_states() {
-    access_state()
-        .access_rate
-        .write()
-        .expect("access_rate map lock poisoned")
-        .clear();
-    access_state()
-        .quota
-        .write()
-        .expect("quota map lock poisoned")
-        .clear();
-}
-
-fn initialize_states_for_profile(target_pubkey: &str, profile: &UsageProfile, now: u64) {
-    if let Some(methods) = profile.methods.as_ref() {
-        let mut map = access_state()
-            .access_rate
-            .write()
-            .expect("access_rate map lock poisoned");
-        for (method, method_rule) in methods {
-            if let Some(rule) = method_rule.access_rate.as_ref() {
-                if let Ok(state) = RateState::from_rule(now, rule) {
-                    map.insert(
-                        AccessKey::Method {
-                            pubkey: target_pubkey.to_string(),
-                            method: method.clone(),
-                        },
-                        state,
-                    );
-                }
-            }
-        }
-    }
-
-    if let Some(rule) = profile.quota.as_ref() {
-        if let Ok(state) = RateState::from_rule(now, rule) {
-            let mut map = access_state()
-                .quota
-                .write()
-                .expect("quota map lock poisoned");
-            map.insert(
-                AccessKey::Quota {
-                    pubkey: target_pubkey.to_string(),
-                },
-                state,
-            );
-        }
-    }
-}
-
-fn upsert_usage_profile_and_reset_states(target_pubkey: &str, profile: UsageProfile) {
-    clear_states_for_pubkey(target_pubkey);
-    initialize_states_for_profile(target_pubkey, &profile, now_micros());
-    upsert_usage_profile(target_pubkey, profile);
 }
 
 pub fn set_relay_pubkey(pubkey: PublicKey) {
@@ -144,13 +70,49 @@ fn parse_grant_target(event: &Event) -> Option<String> {
     }
 }
 
+fn should_apply_grant_event(target_pubkey: &str, event: &Event) -> bool {
+    let created_at = event.created_at.as_secs();
+    let event_id = event.id.to_string();
+
+    let mut map = APPLIED_GRANT_EVENTS
+        .get_or_init(|| RwLock::new(HashMap::new()))
+        .write()
+        .expect("applied grant event map lock poisoned");
+
+    match map.get(target_pubkey) {
+        None => {
+            map.insert(
+                target_pubkey.to_string(),
+                AppliedGrantEvent {
+                    created_at,
+                    event_id,
+                },
+            );
+            true
+        }
+        Some(existing) => {
+            let should_apply = created_at > existing.created_at
+                || (created_at == existing.created_at && event_id > existing.event_id);
+            if should_apply {
+                map.insert(
+                    target_pubkey.to_string(),
+                    AppliedGrantEvent {
+                        created_at,
+                        event_id,
+                    },
+                );
+            }
+            should_apply
+        }
+    }
+}
+
 pub fn clear_usage_profiles() {
-    usage_profile::clear_usage_profiles();
-    clear_all_access_states();
+    usage_profile::clear_all_usage_profiles_and_states();
 }
 
 struct AccessLock<'a> {
-    map: &'a RwLock<HashMap<AccessKey, RateState>>,
+    map: &'a RwLock<HashMap<AccessKey, Arc<Mutex<RateState>>>>,
     key: AccessKey,
     rule: RateLimitRule,
     amount: u64,
@@ -158,7 +120,7 @@ struct AccessLock<'a> {
 }
 
 fn calculate_new_state<K>(
-    map: &RwLock<HashMap<K, RateState>>,
+    map: &RwLock<HashMap<K, Arc<Mutex<RateState>>>>,
     key: &K,
     amount: &u64,
     now: u64,
@@ -168,12 +130,19 @@ where
     K: Eq,
     K: std::hash::Hash,
 {
-    let mut cloned_current_state = map
+    let mut cloned_current_state = if let Some(state_handle) = map
         .read()
         .expect("rate limit state lock poisoned")
         .get(key)
         .cloned()
-        .unwrap_or(RateState::from_rule(now, rule)?);
+    {
+        state_handle
+            .lock()
+            .expect("rate limit state mutex poisoned")
+            .clone()
+    } else {
+        RateState::from_rule(now, rule)?
+    };
 
     cloned_current_state.refill(now, rule)?;
     cloned_current_state.withdraw(*amount)?;
@@ -184,7 +153,7 @@ where
 type Deferred = Box<dyn FnOnce() + Send>;
 
 fn defer_update<K>(
-    map: &'static RwLock<HashMap<K, RateState>>,
+    map: &'static RwLock<HashMap<K, Arc<Mutex<RateState>>>>,
     key: K,
     new_state: RateState,
     deferred: &mut Vec<Deferred>,
@@ -194,7 +163,7 @@ fn defer_update<K>(
     deferred.push(Box::new(move || {
         map.write()
             .expect("access state lock poisoned")
-            .insert(key, new_state);
+            .insert(key, Arc::new(Mutex::new(new_state)));
     }));
 }
 
@@ -247,9 +216,10 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     let caller_pubkey = event.pubkey.to_string();
 
     // type Deferred = Box<dyn FnOnce() + Send>;
-    let mut deferred: Vec<Deferred> = Vec::new();
+    // let mut deferred: Vec<Deferred> = Vec::new();
 
     // Require a UsageProfile grant for the caller.
+    // TODO: Cant these to be combined
     let profile = get_usage_profile(&caller_pubkey);
     let profile = profile.ok_or_else(|| unauthorized_response(&request.method))?;
 
@@ -269,32 +239,27 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
 
     let now = now_micros();
 
-    let mut locks: Vec<AccessLock<>>  = Vec::new();
+    let mut locks: Vec<AccessLock> = Vec::new();
 
     // Prepare rate limit state updates, but only apply if all checks pass.
     if let Some(rule) = method_rule.as_ref().and_then(|r| r.access_rate.as_ref()) {
-        // let map = &access_state().access_rate;
-        // let key = (caller_pubkey.clone(), request.method.clone());
         let amount = 1_000_000;
 
         let lock = AccessLock {
             map: &access_state().access_rate,
-            key: AccessKey::Method {pubkey: caller_pubkey.clone(), method: request.method.clone()},
+            key: AccessKey::Method {
+                pubkey: caller_pubkey.clone(),
+                method: request.method.clone(),
+            },
             rule: rule.clone(),
             amount,
-            error: AccessErrorContext::AccessRate
+            error: AccessErrorContext::AccessRate,
         };
 
         locks.push(lock);
-
-        // Calculate a new state if you fail, fail fast.
-        // let new_state = calculate_new_state(&lock.map, &lock.key, &amount, now, rule).map_err(|e| {
-        //     rate_state_error_response(&request.method, &e, AccessErrorContext::AccessRate)
-        // })?;
-
-        // Ok here we add things to things.
-        // defer_update(&lock.map, lock.key, new_state, &mut deferred);
     }
+
+    // Here we have created the locks vector?
 
     // Prepare quota updates. Only apply if the request spends msats.
     let amount_msat = request_spend_msat(request).unwrap_or(0);
@@ -305,49 +270,44 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
 
             let lock = AccessLock {
                 map: &access_state().quota,
-                key: AccessKey::Quota {pubkey: caller_pubkey.clone()},
+                key: AccessKey::Quota {
+                    pubkey: caller_pubkey.clone(),
+                },
                 rule: rule.clone(),
                 amount: amount_msat,
-                error: AccessErrorContext::Quota
+                error: AccessErrorContext::Quota,
             };
 
             locks.push(lock);
-
-            // let new_state =
-            //     calculate_new_state(map, &key, &amount_msat, now, rule).map_err(|e| {
-            //         rate_state_error_response(&request.method, &e, AccessErrorContext::Quota)
-            //     })?;
-            //
-            // defer_update(map, key, new_state, &mut deferred);
         }
     }
 
     for lock in &locks {
+        // let state = lock.map.read().expect("access state lock poisoned").unwrap().get(&lock.key).unwrap();
+        //
+        // state
+        //     .check_withdraw_after_refill(lock.amount, now, &lock.rule)
+        //     .map_err(|e| rate_state_error_response(&request.method, &e, lock.error))?;
 
         // We just check for errors here update will come later
-        let new_state =
-            calculate_new_state(lock.map, &lock.key, &lock.amount, now, &lock.rule).map_err(|e| {
-                rate_state_error_response(&request.method, &e, lock.error)
-            })?;
+        let new_state = calculate_new_state(lock.map, &lock.key, &lock.amount, now, &lock.rule)
+            .map_err(|e| rate_state_error_response(&request.method, &e, lock.error))?;
 
         // defer_update(lock.map, lock.key, new_state, &mut deferred);
         //
         //     lock.map.write()
         //         .expect("access state lock poisoned")
         //         .insert(lock.key, new_state);
-
-
     }
 
     for lock in locks {
+        let mut map = lock.map.write().expect("rate limit state lock poisoned");
 
-        let mut map = lock.map
-            .write()
-            .expect("rate limit state lock poisoned");
+        let state = map.entry(lock.key).or_insert(Arc::new(Mutex::new(
+            RateState::from_rule(now, &lock.rule).unwrap(),
+        )));
 
-
-        let state = map.entry(lock.key).or_insert(RateState::from_rule(now, &lock.rule).unwrap());
-
+        let mut state = state.lock().expect("rate limit state mutex poisoned");
         state.refill(now, &lock.rule).unwrap();
         state.withdraw_force(lock.amount);
     }
@@ -579,8 +539,14 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
             {
                 for event in events.iter() {
                     if let Some(target_pubkey) = parse_grant_target(event) {
+                        if !should_apply_grant_event(&target_pubkey, event) {
+                            continue;
+                        }
                         if let Ok(profile) = serde_json::from_str::<UsageProfile>(&event.content) {
-                            upsert_usage_profile_and_reset_states(&target_pubkey, profile);
+                            usage_profile::upsert_usage_profile_and_reset_states(
+                                &target_pubkey,
+                                profile,
+                            );
                         }
                     }
                 }
@@ -602,9 +568,15 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
                     }
                     Kind::Custom(30078) => {
                         if let Some(target_pubkey) = parse_grant_target(event) {
+                            if !should_apply_grant_event(&target_pubkey, event) {
+                                continue;
+                            }
                             match serde_json::from_str::<UsageProfile>(&event.content) {
                                 Ok(profile) => {
-                                    upsert_usage_profile_and_reset_states(&target_pubkey, profile);
+                                    usage_profile::upsert_usage_profile_and_reset_states(
+                                        &target_pubkey,
+                                        profile,
+                                    );
                                 }
                                 Err(e) => {
                                     eprintln!("Failed to parse UsageProfile: {}", e);

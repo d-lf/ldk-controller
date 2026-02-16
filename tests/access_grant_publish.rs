@@ -23,12 +23,7 @@ async fn test_publish_and_read_access_grant() -> Result<()> {
     let d_value = format!("{}:{}", relay_pubkey, user_pubkey);
 
     let mut methods = HashMap::new();
-    methods.insert(
-        Method::GetInfo,
-        MethodAccessRule {
-            access_rate: None,
-        },
-    );
+    methods.insert(Method::GetInfo, MethodAccessRule { access_rate: None });
     let profile = UsageProfile {
         quota: None,
         methods: Some(methods),

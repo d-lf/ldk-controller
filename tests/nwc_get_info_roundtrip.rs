@@ -45,30 +45,27 @@ async fn test_nwc_get_info_roundtrip() -> Result<()> {
     // Build a NWC URI
     let client_secret = Keys::generate().secret_key().clone();
     let relay = RelayUrl::parse(&relay_url)?;
-    let uri = NostrWalletConnectUri::new(
-        service_pubkey,
-        vec![relay],
-        client_secret.clone(),
-        None,
-    );
+    let uri = NostrWalletConnectUri::new(service_pubkey, vec![relay], client_secret.clone(), None);
 
     // Create the NWC client and grant get_info access via profile.
     let client_keys = Keys::new(client_secret);
     let client_pubkey = client_keys.public_key();
 
     let mut methods = HashMap::new();
-    methods.insert(
-        Method::GetInfo,
-        MethodAccessRule {
-            access_rate: None,
-        },
-    );
+    methods.insert(Method::GetInfo, MethodAccessRule { access_rate: None });
     let profile = UsageProfile {
         quota: None,
         methods: Some(methods),
     };
     let owner_keys = Keys::generate();
-    grant_usage_profile(&owner_keys, &relay_url, relay_pubkey, client_pubkey, &profile).await?;
+    grant_usage_profile(
+        &owner_keys,
+        &relay_url,
+        relay_pubkey,
+        client_pubkey,
+        &profile,
+    )
+    .await?;
 
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;

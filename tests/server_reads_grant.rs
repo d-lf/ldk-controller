@@ -29,12 +29,7 @@ async fn test_server_reads_usage_profile_grant() -> Result<()> {
     let user_pubkey = Keys::generate().public_key();
 
     let mut methods = HashMap::new();
-    methods.insert(
-        Method::GetInfo,
-        MethodAccessRule {
-            access_rate: None,
-        },
-    );
+    methods.insert(Method::GetInfo, MethodAccessRule { access_rate: None });
     let profile = UsageProfile {
         quota: None,
         methods: Some(methods),

@@ -2,10 +2,7 @@ use ldk_controller::RateLimitRule;
 
 #[test]
 fn accepts_i64_max_capacity() {
-    let json = format!(
-        "{{\"rate_per_micro\":1,\"max_capacity\":{}}}",
-        i64::MAX
-    );
+    let json = format!("{{\"rate_per_micro\":1,\"max_capacity\":{}}}", i64::MAX);
     let rule: RateLimitRule = serde_json::from_str(&json).expect("rule should deserialize");
     assert_eq!(rule.max_capacity, i64::MAX);
 }

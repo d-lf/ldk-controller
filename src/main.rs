@@ -39,8 +39,14 @@ async fn main() -> Result<()> {
     println!("  Listening port: {}", config.node.listening_port);
     println!("  Data dir:       {}", config.node.data_dir);
     println!("  Relay:          {}", config.nostr.relay);
-    println!("  Max channel:    {} sats", config.wallet.max_channel_size_sats);
-    println!("  Min channel:    {} sats", config.wallet.min_channel_size_sats);
+    println!(
+        "  Max channel:    {} sats",
+        config.wallet.max_channel_size_sats
+    );
+    println!(
+        "  Min channel:    {} sats",
+        config.wallet.min_channel_size_sats
+    );
     println!("  Auto accept:    {}", config.wallet.auto_accept_channels);
 
     let keys = match Keys::parse(&config.nostr.private_key) {
@@ -64,7 +70,9 @@ async fn main() -> Result<()> {
     // Keep the main function alive so the background notification handler
     // continues running. Ctrl+C to stop.
     println!("Press Ctrl+C to stop.\n");
-    tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for Ctrl+C");
     client.disconnect().await;
 
     Ok(())

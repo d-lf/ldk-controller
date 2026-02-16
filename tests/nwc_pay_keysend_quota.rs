@@ -1,9 +1,13 @@
 use nostr_sdk::prelude::*;
-use nwc::nostr::nips::nip47::{Method, NostrWalletConnectUri, PayKeysendRequest, Request, Response};
+use nwc::nostr::nips::nip47::{
+    Method, NostrWalletConnectUri, PayKeysendRequest, Request, Response,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 
-use ldk_controller::{clear_usage_profiles, set_relay_pubkey, MethodAccessRule, RateLimitRule, UsageProfile};
+use ldk_controller::{
+    clear_usage_profiles, set_relay_pubkey, MethodAccessRule, RateLimitRule, UsageProfile,
+};
 
 mod common;
 use common::{grant_usage_profile, start_relay, test_guard};
@@ -26,12 +30,7 @@ async fn test_nwc_pay_keysend_quota_exceeded_after_one_call() -> Result<()> {
 
     let client_secret = Keys::generate().secret_key().clone();
     let relay = RelayUrl::parse(&relay_url)?;
-    let uri = NostrWalletConnectUri::new(
-        service_pubkey,
-        vec![relay],
-        client_secret.clone(),
-        None,
-    );
+    let uri = NostrWalletConnectUri::new(service_pubkey, vec![relay], client_secret.clone(), None);
 
     let client_keys = Keys::new(client_secret);
     let client_pubkey = client_keys.public_key();
@@ -54,7 +53,14 @@ async fn test_nwc_pay_keysend_quota_exceeded_after_one_call() -> Result<()> {
         methods: Some(methods),
     };
     let owner_keys = Keys::generate();
-    grant_usage_profile(&owner_keys, &relay_url, relay_pubkey, client_pubkey, &profile).await?;
+    grant_usage_profile(
+        &owner_keys,
+        &relay_url,
+        relay_pubkey,
+        client_pubkey,
+        &profile,
+    )
+    .await?;
 
     let nwc_client = Client::builder().signer(client_keys).build();
     nwc_client.add_relay(&relay_url).await?;

@@ -46,11 +46,7 @@ impl RateState {
     ///
     /// # Errors
     /// Returns `RateStateError::InvalidRule` if `rule.max_capacity` is negative.
-    fn calculate_refill(
-        &self,
-        now: u64,
-        rule: &RateLimitRule,
-    ) -> Result<i64, RateStateError> {
+    fn calculate_refill(&self, now: u64, rule: &RateLimitRule) -> Result<i64, RateStateError> {
         if rule.max_capacity < 0 {
             return Err(RateStateError::InvalidRule {
                 max_capacity: rule.max_capacity,
@@ -145,7 +141,11 @@ impl RateState {
     /// Returns:
     /// - `RateStateError::AmountTooLarge` if `amount` exceeds `i64::MAX`.
     /// - `RateStateError::InvalidRule` if `rule.max_capacity` is negative.
-    pub(crate) fn refund(&mut self, amount: u64, rule: &RateLimitRule) -> Result<(), RateStateError> {
+    pub(crate) fn refund(
+        &mut self,
+        amount: u64,
+        rule: &RateLimitRule,
+    ) -> Result<(), RateStateError> {
         if rule.max_capacity < 0 {
             return Err(RateStateError::InvalidRule {
                 max_capacity: rule.max_capacity,
@@ -183,7 +183,9 @@ impl RateState {
         Ok(())
     }
 
-    #[deprecated(note = "Negative balances are forbidden. Use `refund` or phased withdraw methods.")]
+    #[deprecated(
+        note = "Negative balances are forbidden. Use `refund` or phased withdraw methods."
+    )]
     pub(crate) fn withdraw_force(&mut self, amount: u64) {
         let amount_i64 = i64::try_from(amount).unwrap_or(i64::MAX);
         self.balance = self.balance.saturating_sub(amount_i64);

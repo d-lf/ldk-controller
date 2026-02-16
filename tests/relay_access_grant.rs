@@ -17,9 +17,7 @@ async fn test_relay_connect_and_publish() -> Result<()> {
     publisher.connect().await;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let filter = Filter::new()
-        .kind(Kind::TextNote)
-        .author(publisher_pubkey);
+    let filter = Filter::new().kind(Kind::TextNote).author(publisher_pubkey);
     let subscriber = Client::builder().signer(Keys::generate()).build();
     subscriber.add_relay(&relay_url).await?;
     subscriber.connect().await;

@@ -25,9 +25,7 @@ async fn test_hello_gets_hi_response() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Subscribe to text notes from the app's pubkey so we can see its "Hi" response
-    let filter = Filter::new()
-        .kind(Kind::TextNote)
-        .author(app_pubkey);
+    let filter = Filter::new().kind(Kind::TextNote).author(app_pubkey);
     sender_client.subscribe(filter).await?;
 
     // Send "hello"

@@ -25,12 +25,7 @@ async fn test_nwc_get_info_restricted_for_non_owner() -> Result<()> {
 
     let client_secret = Keys::generate().secret_key().clone();
     let relay = RelayUrl::parse(&relay_url)?;
-    let uri = NostrWalletConnectUri::new(
-        service_pubkey,
-        vec![relay],
-        client_secret.clone(),
-        None,
-    );
+    let uri = NostrWalletConnectUri::new(service_pubkey, vec![relay], client_secret.clone(), None);
 
     // Create the NWC client but do NOT register it as an owner or grant.
     let client_keys = Keys::new(client_secret);

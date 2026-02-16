@@ -1,3 +1,5 @@
+use ldk_controller::UsageProfile;
+use nostr_sdk::prelude::*;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use testcontainers::{
@@ -5,8 +7,6 @@ use testcontainers::{
     runners::AsyncRunner,
     GenericImage,
 };
-use nostr_sdk::prelude::*;
-use ldk_controller::UsageProfile;
 
 /// Starts a fresh strfry relay container and returns (container, relay_url).
 /// The container is automatically removed when dropped.
