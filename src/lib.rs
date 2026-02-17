@@ -1,5 +1,5 @@
 use crate::state::rate_state::RateState;
-use crate::state::store::{access_state, AccessKey};
+use crate::state::store::{access_state, get_access_rate_state, get_quota_state, AccessKey};
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
@@ -9,12 +9,13 @@ use nwc::nostr::nips::nip47::{
     SettleHoldInvoiceResponse, TransactionState, TransactionType,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod rate_limit_rule;
 mod state;
 pub mod usage_profile;
 
+use crate::state::store::access_store::SharedRateState;
 pub use rate_limit_rule::RateLimitRule;
 pub use state::rate_state::RateStateError;
 pub use usage_profile::get_usage_profile;
@@ -111,61 +112,60 @@ pub fn clear_usage_profiles() {
     usage_profile::clear_all_usage_profiles_and_states();
 }
 
-struct AccessLock<'a> {
-    map: &'a RwLock<HashMap<AccessKey, Arc<Mutex<RateState>>>>,
-    key: AccessKey,
+struct AccessGate {
     rule: RateLimitRule,
     amount: u64,
     error: AccessErrorContext,
+    state: SharedRateState,
 }
 
-fn calculate_new_state<K>(
-    map: &RwLock<HashMap<K, Arc<Mutex<RateState>>>>,
-    key: &K,
-    amount: &u64,
-    now: u64,
-    rule: &RateLimitRule,
-) -> Result<RateState, RateStateError>
-where
-    K: Eq,
-    K: std::hash::Hash,
-{
-    let mut cloned_current_state = if let Some(state_handle) = map
-        .read()
-        .expect("rate limit state lock poisoned")
-        .get(key)
-        .cloned()
-    {
-        state_handle
-            .lock()
-            .expect("rate limit state mutex poisoned")
-            .clone()
-    } else {
-        RateState::from_rule(now, rule)?
-    };
-
-    cloned_current_state.refill(now, rule)?;
-    cloned_current_state.withdraw(*amount)?;
-
-    Ok(cloned_current_state)
-}
-
-type Deferred = Box<dyn FnOnce() + Send>;
-
-fn defer_update<K>(
-    map: &'static RwLock<HashMap<K, Arc<Mutex<RateState>>>>,
-    key: K,
-    new_state: RateState,
-    deferred: &mut Vec<Deferred>,
-) where
-    K: Eq + std::hash::Hash + Send + Sync + 'static,
-{
-    deferred.push(Box::new(move || {
-        map.write()
-            .expect("access state lock poisoned")
-            .insert(key, Arc::new(Mutex::new(new_state)));
-    }));
-}
+// fn calculate_new_state<K>(
+//     map: &RwLock<HashMap<K, Arc<Mutex<RateState>>>>,
+//     key: &K,
+//     amount: &u64,
+//     now: u64,
+//     rule: &RateLimitRule,
+// ) -> Result<RateState, RateStateError>
+// where
+//     K: Eq,
+//     K: std::hash::Hash,
+// {
+//     let mut cloned_current_state = if let Some(state_handle) = map
+//         .read()
+//         .expect("rate limit state lock poisoned")
+//         .get(key)
+//         .cloned()
+//     {
+//         state_handle
+//             .lock()
+//             .expect("rate limit state mutex poisoned")
+//             .clone()
+//     } else {
+//         return Err(RateStateError::InternalInvariantViolation);
+//     };
+// 
+//     cloned_current_state.refill(now, rule)?;
+//     cloned_current_state.withdraw(*amount)?;
+// 
+//     Ok(cloned_current_state)
+// }
+// 
+// type Deferred = Box<dyn FnOnce() + Send>;
+// 
+// fn defer_update<K>(
+//     map: &'static RwLock<HashMap<K, Arc<Mutex<RateState>>>>,
+//     key: K,
+//     new_state: RateState,
+//     deferred: &mut Vec<Deferred>,
+// ) where
+//     K: Eq + std::hash::Hash + Send + Sync + 'static,
+// {
+//     deferred.push(Box::new(move || {
+//         map.write()
+//             .expect("access state lock poisoned")
+//             .insert(key, Arc::new(Mutex::new(new_state)));
+//     }));
+// }
 
 // fn update_usage(request: &Request, event: &Event) -> Result<(), Response> {
 //     let caller_pubkey = event.pubkey.to_string();
@@ -215,9 +215,6 @@ fn defer_update<K>(
 fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     let caller_pubkey = event.pubkey.to_string();
 
-    // type Deferred = Box<dyn FnOnce() + Send>;
-    // let mut deferred: Vec<Deferred> = Vec::new();
-
     // Require a UsageProfile grant for the caller.
     // TODO: Cant these to be combined
     let profile = get_usage_profile(&caller_pubkey);
@@ -239,82 +236,76 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
 
     let now = now_micros();
 
-    let mut locks: Vec<AccessLock> = Vec::new();
+    let mut locks: Vec<AccessGate> = Vec::new();
+    let mut guards: Vec<GuardLock> = Vec::new();
 
     // Prepare rate limit state updates, but only apply if all checks pass.
     if let Some(rule) = method_rule.as_ref().and_then(|r| r.access_rate.as_ref()) {
         let amount = 1_000_000;
 
-        let lock = AccessLock {
-            map: &access_state().access_rate,
-            key: AccessKey::Method {
-                pubkey: caller_pubkey.clone(),
-                method: request.method.clone(),
-            },
+        let key = AccessKey::Method {
+            pubkey: caller_pubkey.clone(),
+            method: request.method.clone(),
+        };
+
+        let state = get_access_rate_state(&key).unwrap();
+
+        let lock = AccessGate {
             rule: rule.clone(),
             amount,
             error: AccessErrorContext::AccessRate,
+            state,
         };
 
         locks.push(lock);
     }
 
     // Here we have created the locks vector?
+    struct GuardLock<'a> {
+        lock: &'a AccessGate,
+        guard: MutexGuard<'a, RateState>,
+    }
 
     // Prepare quota updates. Only apply if the request spends msats.
     let amount_msat = request_spend_msat(request).unwrap_or(0);
     if amount_msat > 0 {
         if let Some(rule) = profile.quota.as_ref() {
-            // let map = &access_state().quota;
-            // let key = caller_pubkey.clone();
+            let key = AccessKey::Quota {
+                pubkey: caller_pubkey.clone(),
+            };
 
-            let lock = AccessLock {
-                map: &access_state().quota,
-                key: AccessKey::Quota {
-                    pubkey: caller_pubkey.clone(),
-                },
+            let state = get_quota_state(&key).unwrap();
+
+            let lock = AccessGate {
                 rule: rule.clone(),
                 amount: amount_msat,
                 error: AccessErrorContext::Quota,
+                state,
             };
 
             locks.push(lock);
         }
     }
 
+    // Lock
     for lock in &locks {
-        // let state = lock.map.read().expect("access state lock poisoned").unwrap().get(&lock.key).unwrap();
-        //
-        // state
-        //     .check_withdraw_after_refill(lock.amount, now, &lock.rule)
-        //     .map_err(|e| rate_state_error_response(&request.method, &e, lock.error))?;
+        let guard = lock.state.lock().unwrap();
+        guards.push(GuardLock { lock, guard });
+    }
 
-        // We just check for errors here update will come later
-        let new_state = calculate_new_state(lock.map, &lock.key, &lock.amount, now, &lock.rule)
+    // Verify
+    for guard_lock in &guards {
+        let lock = guard_lock.lock;
+        guard_lock.guard
+            .check_withdraw_after_refill(lock.amount, now, &lock.rule)
             .map_err(|e| rate_state_error_response(&request.method, &e, lock.error))?;
-
-        // defer_update(lock.map, lock.key, new_state, &mut deferred);
-        //
-        //     lock.map.write()
-        //         .expect("access state lock poisoned")
-        //         .insert(lock.key, new_state);
     }
 
-    for lock in locks {
-        let mut map = lock.map.write().expect("rate limit state lock poisoned");
-
-        let state = map.entry(lock.key).or_insert(Arc::new(Mutex::new(
-            RateState::from_rule(now, &lock.rule).unwrap(),
-        )));
-
-        let mut state = state.lock().expect("rate limit state mutex poisoned");
-        state.refill(now, &lock.rule).unwrap();
-        state.withdraw_force(lock.amount);
+    // Debit
+    for mut guard_lock in guards {
+        let lock = guard_lock.lock;
+        guard_lock.guard.withdraw_after_refill(lock.amount, now, &lock.rule).unwrap();
     }
-
-    // for deferred_function in deferred {
-    //     deferred_function();
-    // }
 
     Ok(())
 }
@@ -398,6 +389,36 @@ fn rate_state_error_response(
     Response {
         result_type: method.clone(),
         error: Some(map_rate_state_error(error, context)),
+        result: None,
+    }
+}
+
+fn missing_state_response(method: &Method, context: AccessErrorContext) -> Response {
+    let message = match context {
+        AccessErrorContext::AccessRate => "missing access rate state",
+        AccessErrorContext::Quota => "missing quota state",
+    };
+    Response {
+        result_type: method.clone(),
+        error: Some(NIP47Error {
+            code: ErrorCode::Other,
+            message: message.to_string(),
+        }),
+        result: None,
+    }
+}
+
+fn poisoned_state_response(method: &Method, context: AccessErrorContext) -> Response {
+    let message = match context {
+        AccessErrorContext::AccessRate => "access rate state lock poisoned",
+        AccessErrorContext::Quota => "quota state lock poisoned",
+    };
+    Response {
+        result_type: method.clone(),
+        error: Some(NIP47Error {
+            code: ErrorCode::Other,
+            message: message.to_string(),
+        }),
         result: None,
     }
 }

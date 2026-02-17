@@ -33,17 +33,21 @@ JSON bounds and error-mapping tests are organized in subfolders:
 ## Lifecycle and Concurrency Direction
 
 1. State is ephemeral and reconstructed from relay/profile data on startup.
-2. On profile/rule updates from the Nostr relay, corresponding states are recreated:
+2. State creation/reset is profile-driven only:
+   - states are created only when profiles/rules are upserted
+   - old states are removed when profile rules are replaced/removed
+   - access handling must not lazily create missing states
+3. On profile/rule updates from the Nostr relay, corresponding states are recreated:
    - new rule -> create corresponding state
    - replaced/old rule state -> delete previous state
    - counters are reset on update
-3. Accounting is per-attempt, not per logical payment intent.
-4. For correctness under concurrency, updates should happen with state locked:
+4. Accounting is per-attempt, not per logical payment intent.
+5. For correctness under concurrency, updates should happen with state locked:
    - check (compute projected balance after simulated refill and verify projected balance >= amount)
    - refill
    - debit
    - refund on fail
-5. Preferred direction discussed:
+6. Preferred direction discussed:
    - map lock for structural changes
    - per-state lock for mutation (`Arc<Mutex<RateState>>` style)
 

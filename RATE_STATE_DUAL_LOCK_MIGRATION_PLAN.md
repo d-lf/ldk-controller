@@ -26,31 +26,45 @@ This aligns runtime behavior with the agreed accounting order:
 
 ## Step 2: Add Store-Level Helpers
 
-- Add helper APIs in `state/store` for state-handle lifecycle, e.g.:
+- Add helper APIs in `state/store` for state-handle lifecycle:
   - get existing handle
-  - create and insert if missing
-  - remove/clear by key/pubkey
+  - insert known state
+  - retain/remove/clear by key/pubkey
 - Keep map-locking centralized in store helpers.
+- Do not add lazy-create helpers for access path (`get_or_insert` style).
 
 **Testable outcome**
 
-- `lib.rs` no longer accesses raw map internals directly for normal state lookup/create flow.
+- Store APIs exist for lifecycle operations without lazy-create semantics.
 - Existing tests pass.
 
-## Step 3: Migrate `verify_access` to Dual-Lock Phases
+## Step 3: Make Profile Service the Sole State Creator
+
+- Refactor `usage_profile/service.rs` to use store helpers for all structural operations.
+- On profile upsert:
+  - remove prior states for target pubkey
+  - create fresh states from incoming rules
+- Ensure this is the only state creation/reset path.
+
+**Testable outcome**
+
+- Profile update/reset behavior remains correct.
+- Existing profile/grant tests continue passing.
+
+## Step 4: Migrate `verify_access` to No-Lazy-Create Dual-Lock Phases
 
 - Replace clone-and-reinsert flow with handle-based flow:
-  - fetch/create `Arc<Mutex<RateState>>`
+  - fetch existing `Arc<Mutex<RateState>>` (no lazy creation)
   - check phase: lock state and call `check_withdraw_after_refill`
   - commit phase: lock state and call `withdraw_after_refill`
 - For multi-state operations (method + quota), use deterministic lock ordering to avoid deadlocks.
 
 **Testable outcome**
 
-- Access checks and commits work without map-value replacement.
-- Existing rate-limit/quota tests continue passing.
+- Access checks/commits work without map-value replacement or lazy state creation.
+- Missing state in access path is handled as a deterministic error.
 
-## Step 4: Integrate Refund Path
+## Step 5: Integrate Refund Path
 
 - After commit, on downstream execution failure:
   - lock the same state handle
@@ -62,7 +76,7 @@ This aligns runtime behavior with the agreed accounting order:
 - Failure paths correctly restore state up to cap.
 - Dedicated tests pass for refund correctness.
 
-## Step 5: Remove Deprecated Accounting Calls From Access Path
+## Step 6: Remove Deprecated Accounting Calls From Access Path
 
 - Remove use of deprecated methods in access flow:
   - `refill`
@@ -78,7 +92,7 @@ This aligns runtime behavior with the agreed accounting order:
 - Access path has no deprecated accounting calls.
 - Compile warnings from this path are removed.
 
-## Step 6: Add Concurrency-Focused Tests
+## Step 7: Add Concurrency-Focused Tests
 
 - Add tests under integration subfolders for:
   - concurrent requests on same key
@@ -91,7 +105,7 @@ This aligns runtime behavior with the agreed accounting order:
 - New tests pass consistently across repeated runs.
 - No duplicate-reset or race regressions observed.
 
-## Step 7: Add Lock-Hold Instrumentation
+## Step 8: Add Lock-Hold Instrumentation
 
 - Add temporary timing metrics/logging around:
   - map lock hold time
@@ -103,7 +117,7 @@ This aligns runtime behavior with the agreed accounting order:
 - Metrics captured and reviewed.
 - Lock contention profile documented.
 
-## Step 8: Cleanup and Documentation
+## Step 9: Cleanup and Documentation
 
 - Remove dead helpers and unused deferred-update artifacts.
 - Update architecture docs:
