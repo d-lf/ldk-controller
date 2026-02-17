@@ -8,6 +8,8 @@ use testcontainers::{
     GenericImage,
 };
 
+pub mod bitcoind;
+
 /// Starts a fresh strfry relay container and returns (container, relay_url).
 /// The container is automatically removed when dropped.
 pub async fn start_relay() -> (testcontainers::ContainerAsync<GenericImage>, String) {
