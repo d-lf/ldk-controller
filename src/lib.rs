@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod rate_limit_rule;
+pub mod lightning;
 mod state;
 pub mod usage_profile;
 
