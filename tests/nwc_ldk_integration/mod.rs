@@ -4,8 +4,11 @@ pub mod common;
 mod get_balance_after_onchain_funding;
 mod get_info_returns_ldk_identity;
 mod make_invoice_happy_path;
+mod make_invoice_invalid_description_hash_returns_error;
 mod pay_invoice_invalid_invoice_returns_error;
+mod pay_invoice_zero_amount_returns_error;
 mod pay_keysend_invalid_pubkey_returns_error;
+mod pay_keysend_zero_amount_returns_error;
 
 use nostr_sdk::prelude::{Keys, PublicKey};
 use std::sync::OnceLock;

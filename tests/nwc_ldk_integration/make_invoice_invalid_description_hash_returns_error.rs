@@ -3,7 +3,7 @@ use std::time::Duration;
 use ldk_controller::lightning::{LdkService, LdkServiceConfig};
 use ldk_controller::{clear_usage_profiles, run_nwc_service_with_ldk, set_relay_pubkey, UsageProfile};
 use nostr_sdk::prelude::*;
-use nwc::nostr::nips::nip47::{NostrWalletConnectUri, PayInvoiceRequest, Request, Response};
+use nwc::nostr::nips::nip47::{MakeInvoiceRequest, NostrWalletConnectUri, Request, Response};
 
 use crate::nwc_ldk_integration_suite::common::{grant_usage_profile, start_relay, test_guard};
 use crate::nwc_ldk_integration_suite::shared_relay_pubkey;
@@ -52,7 +52,7 @@ async fn send_request_and_read_response(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pay_invoice_invalid_invoice_returns_error() -> Result<()> {
+async fn make_invoice_invalid_description_hash_returns_error() -> Result<()> {
     let _guard = test_guard();
     clear_usage_profiles();
 
@@ -68,7 +68,7 @@ async fn pay_invoice_invalid_invoice_returns_error() -> Result<()> {
         bitcoind_rpc_port: bitcoind.rpc_port(),
         bitcoind_rpc_user: bitcoind.rpc_user().to_string(),
         bitcoind_rpc_password: bitcoind.rpc_password().to_string(),
-        ldk_storage_dir: unique_storage_dir("nwc-ldk-pay-invoice-invalid"),
+        ldk_storage_dir: unique_storage_dir("nwc-ldk-make-invoice-invalid-description-hash"),
         ldk_listen_addr: None,
     };
     let ldk_service = LdkService::start_from_config(&ldk_cfg).expect("ldk service should start");
@@ -114,20 +114,21 @@ async fn pay_invoice_invalid_invoice_returns_error() -> Result<()> {
         )
         .await?;
 
-    let request = Request::pay_invoice(PayInvoiceRequest {
-        id: None,
-        invoice: "not-a-bolt11-invoice".to_string(),
-        amount: None,
+    let request = Request::make_invoice(MakeInvoiceRequest {
+        amount: 123_000,
+        description: Some("invoice from nwc".to_string()),
+        description_hash: Some("ab".repeat(32)),
+        expiry: Some(3600),
     });
 
     let response = send_request_and_read_response(&nwc_client, &uri, service_pubkey, request).await;
     let err = response
         .error
-        .expect("expected pay_invoice to fail with invalid invoice");
-    assert_eq!(err.code, nwc::nostr::nips::nip47::ErrorCode::PaymentFailed);
+        .expect("expected make_invoice to fail with unsupported description_hash");
+    assert_eq!(err.code, nwc::nostr::nips::nip47::ErrorCode::Other);
     assert!(
         err.message
-            .starts_with("ldk pay_invoice failed: invalid invoice:"),
+            .starts_with("ldk make_invoice failed: invalid invoice request:"),
         "unexpected error message: {}",
         err.message
     );

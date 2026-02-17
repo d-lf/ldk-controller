@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::lightning::LdkService;
+use crate::lightning::{LdkService, LdkServiceError};
 pub mod rate_limit_rule;
 pub mod lightning;
 mod state;
@@ -369,6 +369,17 @@ fn quota_exceeded_response(method: &Method) -> Response {
             message: "quota exceeded".to_string(),
         }),
         result: None,
+    }
+}
+
+fn map_ldk_service_error(
+    operation: &'static str,
+    code: ErrorCode,
+    error: LdkServiceError,
+) -> NIP47Error {
+    NIP47Error {
+        code,
+        message: format!("ldk {operation} failed: {error}"),
     }
 }
 
@@ -736,6 +747,12 @@ impl Handler for PayInvoiceHandler {
                     message: "invoice is required".to_string(),
                 });
             }
+            if params.amount == Some(0) {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "amount must be greater than 0".to_string(),
+                });
+            }
             return Ok(());
         }
 
@@ -751,10 +768,7 @@ impl Handler for PayInvoiceHandler {
         {
             let payment = ldk_service
                 .pay_invoice(&params.invoice, params.amount)
-                .map_err(|e| NIP47Error {
-                    code: ErrorCode::PaymentFailed,
-                    message: format!("ldk pay_invoice failed: {e}"),
-                })?;
+                .map_err(|e| map_ldk_service_error("pay_invoice", ErrorCode::PaymentFailed, e))?;
             return Ok(Response {
                 result_type: Method::PayInvoice,
                 error: None,
@@ -808,10 +822,7 @@ impl Handler for PayKeysendHandler {
         {
             let payment = ldk_service
                 .pay_keysend(&params.pubkey, params.amount)
-                .map_err(|e| NIP47Error {
-                    code: ErrorCode::PaymentFailed,
-                    message: format!("ldk pay_keysend failed: {e}"),
-                })?;
+                .map_err(|e| map_ldk_service_error("pay_keysend", ErrorCode::PaymentFailed, e))?;
             return Ok(Response {
                 result_type: Method::PayKeysend,
                 error: None,
@@ -864,10 +875,7 @@ impl Handler for MakeInvoiceHandler {
                     params.description_hash.as_deref(),
                     params.expiry,
                 )
-                .map_err(|e| NIP47Error {
-                    code: ErrorCode::Other,
-                    message: format!("ldk make_invoice failed: {e}"),
-                })?;
+                .map_err(|e| map_ldk_service_error("make_invoice", ErrorCode::Other, e))?;
             return Ok(Response {
                 result_type: Method::MakeInvoice,
                 error: None,

@@ -21,10 +21,19 @@ Run NWC on top of a single live `LdkService` and replace stubbed wallet actions 
 - [x] `make_invoice` handler uses live LDK call.
 - [x] `pay_invoice` handler uses live LDK call.
 - [x] `pay_keysend` handler uses live LDK call.
+- [x] Centralized LDK -> NIP47 mapping helper for `make_invoice`/`pay_invoice`/`pay_keysend`.
 - [x] Phase-4 integration tests added:
   - `make_invoice_happy_path`
   - `pay_invoice_invalid_invoice_returns_error`
   - `pay_keysend_invalid_pubkey_returns_error`
+- [x] Phase-5 mapping coverage added:
+  - message+code assertions for `pay_invoice` invalid invoice
+  - message+code assertions for `pay_keysend` invalid pubkey
+  - `make_invoice_invalid_description_hash_returns_error`
+- [x] Phase-6 payment coverage added:
+  - `pay_keysend_zero_amount_returns_error`
+  - `pay_invoice_zero_amount_returns_error`
+  - `pay_invoice` validation rejects `amount=0`
 - [x] Full `cargo test -- --nocapture` green in Docker-enabled run.
 
 ## Current Design Decisions
@@ -36,7 +45,7 @@ Run NWC on top of a single live `LdkService` and replace stubbed wallet actions 
 
 ## Next Phases
 
-### Phase 5: Centralize LDK -> NIP47 Error Mapping
+### Phase 5: Centralize LDK -> NIP47 Error Mapping (Done)
 
 1. Add one helper used by all LDK-backed handlers (likely in `src/lib.rs` or `src/lightning/`).
 2. Normalize mapping for:
@@ -46,7 +55,7 @@ Run NWC on top of a single live `LdkService` and replace stubbed wallet actions 
 3. Update `MakeInvoiceHandler`, `PayInvoiceHandler`, `PayKeysendHandler` to use helper.
 4. Add focused tests asserting stable error codes/messages.
 
-### Phase 6: Strengthen Payment Coverage
+### Phase 6: Strengthen Payment Coverage (Done)
 
 1. Add stable NWC-level negative-path tests for:
    - invalid amount
@@ -77,6 +86,16 @@ Run NWC on top of a single live `LdkService` and replace stubbed wallet actions 
 ## Validation Command
 
 - `cargo test -- --nocapture`
+
+## Latest Validation Snapshot
+
+- Date: 2026-02-17
+- Command: `cargo test --test nwc_ldk_integration -- --nocapture`
+- Result: `ok` (6 passed, 0 failed)
+
+## Immediate Next Action
+
+- Execute Phase 6 by adding deterministic negative-path payment coverage for invalid amount handling.
 
 ## Done Criteria
 

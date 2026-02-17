@@ -127,6 +127,12 @@ async fn pay_keysend_invalid_pubkey_returns_error() -> Result<()> {
         .error
         .expect("expected pay_keysend to fail with invalid pubkey");
     assert_eq!(err.code, nwc::nostr::nips::nip47::ErrorCode::PaymentFailed);
+    assert!(
+        err.message
+            .starts_with("ldk pay_keysend failed: invalid pubkey:"),
+        "unexpected error message: {}",
+        err.message
+    );
 
     ldk_service.stop().expect("ldk service should stop cleanly");
 
