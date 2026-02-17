@@ -1,5 +1,5 @@
 use crate::state::rate_state::RateState;
-use crate::state::store::{access_state, get_access_rate_state, get_quota_state, AccessKey};
+use crate::state::store::{get_access_rate_state, get_quota_state, AccessKey};
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
@@ -8,8 +8,9 @@ use nwc::nostr::nips::nip47::{
     PayInvoiceResponse, PayKeysendResponse, Request, RequestParams, Response, ResponseResult,
     SettleHoldInvoiceResponse, TransactionState, TransactionType,
 };
+use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::{Arc, LockResult, Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod rate_limit_rule;
 mod state;
@@ -112,105 +113,36 @@ pub fn clear_usage_profiles() {
     usage_profile::clear_all_usage_profiles_and_states();
 }
 
-struct AccessGate {
+struct StateUpdateRequest {
+    key: AccessKey,
     rule: RateLimitRule,
     amount: u64,
-    error: AccessErrorContext,
+    context: AccessErrorContext,
     state: SharedRateState,
 }
 
-// fn calculate_new_state<K>(
-//     map: &RwLock<HashMap<K, Arc<Mutex<RateState>>>>,
-//     key: &K,
-//     amount: &u64,
-//     now: u64,
-//     rule: &RateLimitRule,
-// ) -> Result<RateState, RateStateError>
-// where
-//     K: Eq,
-//     K: std::hash::Hash,
-// {
-//     let mut cloned_current_state = if let Some(state_handle) = map
-//         .read()
-//         .expect("rate limit state lock poisoned")
-//         .get(key)
-//         .cloned()
-//     {
-//         state_handle
-//             .lock()
-//             .expect("rate limit state mutex poisoned")
-//             .clone()
-//     } else {
-//         return Err(RateStateError::InternalInvariantViolation);
-//     };
-// 
-//     cloned_current_state.refill(now, rule)?;
-//     cloned_current_state.withdraw(*amount)?;
-// 
-//     Ok(cloned_current_state)
-// }
-// 
-// type Deferred = Box<dyn FnOnce() + Send>;
-// 
-// fn defer_update<K>(
-//     map: &'static RwLock<HashMap<K, Arc<Mutex<RateState>>>>,
-//     key: K,
-//     new_state: RateState,
-//     deferred: &mut Vec<Deferred>,
-// ) where
-//     K: Eq + std::hash::Hash + Send + Sync + 'static,
-// {
-//     deferred.push(Box::new(move || {
-//         map.write()
-//             .expect("access state lock poisoned")
-//             .insert(key, Arc::new(Mutex::new(new_state)));
-//     }));
-// }
+struct GuardedStateUpdate<'a> {
+    update: &'a StateUpdateRequest,
+    guard: MutexGuard<'a, RateState>,
+}
 
-// fn update_usage(request: &Request, event: &Event) -> Result<(), Response> {
-//     let caller_pubkey = event.pubkey.to_string();
-//
-//     // Require a UsageProfile grant for the caller.
-//     let profile = {
-//         let map = usage_profiles()
-//             .read()
-//             .expect("usage profile map lock poisoned");
-//         map.get(&caller_pubkey).cloned()
-//     };
-//     let profile = profile.ok_or_else(|| unauthorized_response(&request.method))?;
-//
-//     // Method authorization: missing methods means no restriction.
-//     let method_rule = match &profile.methods {
-//         None => None,
-//         Some(methods) => {
-//             if methods.is_empty() {
-//                 return Err(access_denied_response(&request.method));
-//             }
-//             match methods.get(&request.method) {
-//                 Some(rule) => Some(rule.clone()),
-//                 None => return Err(access_denied_response(&request.method)),
-//             }
-//         }
-//     };
-//
-//     let now = now_micros();
-//
-//     // Prepare rate limit state updates, but only apply if all checks pass.
-//     if let Some(rule) = method_rule.as_ref().and_then(|r| r.access_rate.as_ref()) {
-//         let map = &access_state().access_rate;
-//         let key = (caller_pubkey.clone(), request.method.clone());
-//         let amount = 1_000_000;
-//
-//         // Calculate a new state if you fail, fail fast.
-//         let new_state = calculate_new_state(map, &key, &amount, now, rule)
-//             .map_err(|e| rate_state_error_response(&request.method, &e, AccessErrorContext::AccessRate))?;
-//
-//         // Ok here we add things to things.
-//     }
-//
-//
-//     Ok(())
-// }
+fn compare_access_keys(a: &AccessKey, b: &AccessKey) -> Ordering {
+    match (a, b) {
+        (
+            AccessKey::Method {
+                pubkey: ap,
+                method: am,
+            },
+            AccessKey::Method {
+                pubkey: bp,
+                method: bm,
+            },
+        ) => ap.cmp(bp).then_with(|| am.as_str().cmp(bm.as_str())),
+        (AccessKey::Method { .. }, AccessKey::Quota { .. }) => Ordering::Less,
+        (AccessKey::Quota { .. }, AccessKey::Method { .. }) => Ordering::Greater,
+        (AccessKey::Quota { pubkey: ap }, AccessKey::Quota { pubkey: bp }) => ap.cmp(bp),
+    }
+}
 
 fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
     let caller_pubkey = event.pubkey.to_string();
@@ -236,8 +168,8 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
 
     let now = now_micros();
 
-    let mut locks: Vec<AccessGate> = Vec::new();
-    let mut guards: Vec<GuardLock> = Vec::new();
+    let mut state_updates: Vec<StateUpdateRequest> = Vec::new();
+    let mut guarded_updates: Vec<GuardedStateUpdate> = Vec::new();
 
     // Prepare rate limit state updates, but only apply if all checks pass.
     if let Some(rule) = method_rule.as_ref().and_then(|r| r.access_rate.as_ref()) {
@@ -248,22 +180,19 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
             method: request.method.clone(),
         };
 
-        let state = get_access_rate_state(&key).unwrap();
+        let state = get_access_rate_state(&key).ok_or_else(|| {
+            missing_state_response(&request.method, AccessErrorContext::AccessRate)
+        })?;
 
-        let lock = AccessGate {
+        let state_update = StateUpdateRequest {
+            key,
             rule: rule.clone(),
             amount,
-            error: AccessErrorContext::AccessRate,
+            context: AccessErrorContext::AccessRate,
             state,
         };
 
-        locks.push(lock);
-    }
-
-    // Here we have created the locks vector?
-    struct GuardLock<'a> {
-        lock: &'a AccessGate,
-        guard: MutexGuard<'a, RateState>,
+        state_updates.push(state_update);
     }
 
     // Prepare quota updates. Only apply if the request spends msats.
@@ -274,37 +203,52 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
                 pubkey: caller_pubkey.clone(),
             };
 
-            let state = get_quota_state(&key).unwrap();
+            let state = get_quota_state(&key).ok_or_else(|| {
+                missing_state_response(&request.method, AccessErrorContext::Quota)
+            })?;
 
-            let lock = AccessGate {
+            let state_update = StateUpdateRequest {
+                key,
                 rule: rule.clone(),
                 amount: amount_msat,
-                error: AccessErrorContext::Quota,
+                context: AccessErrorContext::Quota,
                 state,
             };
 
-            locks.push(lock);
+            state_updates.push(state_update);
         }
     }
 
+    state_updates.sort_by(|a, b| compare_access_keys(&a.key, &b.key));
+
     // Lock
-    for lock in &locks {
-        let guard = lock.state.lock().unwrap();
-        guards.push(GuardLock { lock, guard });
+    for state_update in &state_updates {
+        let guard = state_update
+            .state
+            .lock()
+            .map_err(|_| poisoned_state_response(&request.method, state_update.context))?;
+        guarded_updates.push(GuardedStateUpdate {
+            update: state_update,
+            guard,
+        });
     }
 
     // Verify
-    for guard_lock in &guards {
-        let lock = guard_lock.lock;
-        guard_lock.guard
-            .check_withdraw_after_refill(lock.amount, now, &lock.rule)
-            .map_err(|e| rate_state_error_response(&request.method, &e, lock.error))?;
+    for guarded_update in &guarded_updates {
+        let state_update = guarded_update.update;
+        guarded_update
+            .guard
+            .check_withdraw_after_refill(state_update.amount, now, &state_update.rule)
+            .map_err(|e| rate_state_error_response(&request.method, &e, state_update.context))?;
     }
 
     // Debit
-    for mut guard_lock in guards {
-        let lock = guard_lock.lock;
-        guard_lock.guard.withdraw_after_refill(lock.amount, now, &lock.rule).unwrap();
+    for guarded_update in &mut guarded_updates {
+        let state_update = guarded_update.update;
+        guarded_update
+            .guard
+            .withdraw_after_refill(state_update.amount, now, &state_update.rule)
+            .map_err(|e| rate_state_error_response(&request.method, &e, state_update.context))?;
     }
 
     Ok(())
