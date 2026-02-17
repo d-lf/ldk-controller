@@ -9,7 +9,7 @@ use nwc::nostr::nips::nip47::{
     SettleHoldInvoiceResponse, TransactionState, TransactionType,
 };
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod rate_limit_rule;
@@ -32,6 +32,7 @@ static GLOBAL_KEYS: OnceLock<Keys> = OnceLock::new();
 static RELAY_PUBKEY: OnceLock<PublicKey> = OnceLock::new();
 static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 static APPLIED_GRANT_EVENTS: OnceLock<RwLock<HashMap<String, AppliedGrantEvent>>> = OnceLock::new();
+static FORCED_EXECUTE_FAILURES: OnceLock<RwLock<HashSet<Method>>> = OnceLock::new();
 
 #[derive(Clone)]
 struct AppliedGrantEvent {
@@ -118,6 +119,34 @@ pub fn clear_access_states_for_testing() {
     usage_profile::service::clear_all_access_states();
 }
 
+#[doc(hidden)]
+pub fn set_execute_failure_for_testing(method: Method, enabled: bool) {
+    let lock = FORCED_EXECUTE_FAILURES.get_or_init(|| RwLock::new(HashSet::new()));
+    let mut guard = lock
+        .write()
+        .expect("forced execute failures lock poisoned");
+    if enabled {
+        guard.insert(method);
+    } else {
+        guard.remove(&method);
+    }
+}
+
+#[doc(hidden)]
+pub fn clear_execute_failures_for_testing() {
+    let lock = FORCED_EXECUTE_FAILURES.get_or_init(|| RwLock::new(HashSet::new()));
+    let mut guard = lock
+        .write()
+        .expect("forced execute failures lock poisoned");
+    guard.clear();
+}
+
+fn should_force_execute_failure(method: &Method) -> bool {
+    let lock = FORCED_EXECUTE_FAILURES.get_or_init(|| RwLock::new(HashSet::new()));
+    let guard = lock.read().expect("forced execute failures lock poisoned");
+    guard.contains(method)
+}
+
 struct StateUpdateRequest {
     key: AccessKey,
     rule: RateLimitRule,
@@ -149,7 +178,7 @@ fn compare_access_keys(a: &AccessKey, b: &AccessKey) -> Ordering {
     }
 }
 
-fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
+fn verify_access(request: &Request, event: &Event) -> Result<Vec<StateUpdateRequest>, Response> {
     let caller_pubkey = event.pubkey.to_string();
 
     // Require a UsageProfile grant for the caller.
@@ -256,7 +285,32 @@ fn verify_access(request: &Request, event: &Event) -> Result<(), Response> {
             .map_err(|e| rate_state_error_response(&request.method, &e, state_update.context))?;
     }
 
-    Ok(())
+    drop(guarded_updates);
+
+    Ok(state_updates)
+}
+
+fn refund_applied_state_updates(method: &Method, updates: &[StateUpdateRequest]) {
+    for update in updates {
+        let mut guard = match update.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                eprintln!(
+                    "Failed to refund {:?}: state lock poisoned ({:?})",
+                    method, update.context
+                );
+                continue;
+            }
+        };
+
+        if let Err(error) = guard.refund(update.amount, &update.rule) {
+            let mapped = map_rate_state_error(&error, update.context);
+            eprintln!(
+                "Failed to refund {:?}: {} ({:?})",
+                method, mapped.message, mapped.code
+            );
+        }
+    }
 }
 
 fn access_denied_response(method: &Method) -> Response {
@@ -937,9 +991,10 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
 
 async fn process_nwc_request(request: Request, event: &Event) -> Response {
     // Check that the user is authorized
-    if let Err(response) = verify_access(&request, event) {
-        return response;
-    }
+    let _applied_state_updates = match verify_access(&request, event) {
+        Ok(state_updates) => state_updates,
+        Err(response) => return response,
+    };
 
     // Check that we support the requested method
     if !request_handlers().contains_key(&request.method) {
@@ -965,12 +1020,27 @@ async fn process_nwc_request(request: Request, event: &Event) -> Response {
         };
     }
 
-    // Execute the request
-    handler
-        .execute(&request, &event.pubkey.to_string())
-        .unwrap()
+    let execution_result = if should_force_execute_failure(&request.method) {
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "forced execute failure for testing".to_string(),
+        })
+    } else {
+        handler.execute(&request, &event.pubkey.to_string())
+    };
 
-    // Account
+    // Execute the request.
+    match execution_result {
+        Ok(response) => response,
+        Err(e) => {
+            refund_applied_state_updates(&request.method, &_applied_state_updates);
+            Response {
+                result_type: request.method.clone(),
+                error: Some(e),
+                result: None,
+            }
+        }
+    }
 }
 
 fn allowed_methods_for(caller_pubkey: &str) -> Vec<Method> {
