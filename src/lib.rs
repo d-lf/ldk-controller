@@ -10,8 +10,9 @@ use nwc::nostr::nips::nip47::{
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::{MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::lightning::LdkService;
 pub mod rate_limit_rule;
 pub mod lightning;
 mod state;
@@ -34,6 +35,7 @@ static RELAY_PUBKEY: OnceLock<PublicKey> = OnceLock::new();
 static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 static APPLIED_GRANT_EVENTS: OnceLock<RwLock<HashMap<String, AppliedGrantEvent>>> = OnceLock::new();
 static FORCED_EXECUTE_FAILURES: OnceLock<RwLock<HashSet<Method>>> = OnceLock::new();
+static LDK_SERVICE: OnceLock<RwLock<Option<Arc<LdkService>>>> = OnceLock::new();
 
 #[derive(Clone)]
 struct AppliedGrantEvent {
@@ -43,6 +45,18 @@ struct AppliedGrantEvent {
 
 fn set_global_keys(keys: &Keys) {
     let _ = GLOBAL_KEYS.set(keys.clone());
+}
+
+fn set_ldk_service(ldk_service: Arc<LdkService>) {
+    let lock = LDK_SERVICE.get_or_init(|| RwLock::new(None));
+    let mut guard = lock.write().expect("ldk service lock poisoned");
+    *guard = Some(ldk_service);
+}
+
+fn get_ldk_service() -> Option<Arc<LdkService>> {
+    let lock = LDK_SERVICE.get_or_init(|| RwLock::new(None));
+    let guard = lock.read().expect("ldk service lock poisoned");
+    guard.clone()
 }
 
 pub fn set_relay_pubkey(pubkey: PublicKey) {
@@ -620,6 +634,15 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
     Ok(client)
 }
 
+pub async fn run_nwc_service_with_ldk(
+    keys: Keys,
+    relay_url: &str,
+    ldk_service: Arc<LdkService>,
+) -> Result<Client> {
+    set_ldk_service(ldk_service);
+    run_nwc_service(keys, relay_url).await
+}
+
 trait Handler: Send + Sync {
     fn validate(&self, req: &Request) -> Result<(), NIP47Error>;
     fn execute(&self, req: &Request, caller_pubkey: &str) -> Result<Response, NIP47Error>;
@@ -640,14 +663,22 @@ impl Handler for GetInfoHandler {
 
     fn execute(&self, _req: &Request, caller_pubkey: &str) -> Result<Response, NIP47Error> {
         let methods = allowed_methods_for(caller_pubkey);
+        let (pubkey, network) = if let Some(ldk_service) = get_ldk_service() {
+            (ldk_service.node_id(), ldk_service.network().to_string())
+        } else {
+            (
+                GLOBAL_KEYS.get().unwrap().public_key().to_string(),
+                "regtest".to_string(),
+            )
+        };
         Ok(Response {
             result_type: Method::GetInfo,
             error: None,
             result: Some(ResponseResult::GetInfo(GetInfoResponse {
                 alias: Some("ldk-controller".to_string()),
                 color: None,
-                pubkey: Some(GLOBAL_KEYS.get().unwrap().public_key().to_string()),
-                network: Some("regtest".to_string()),
+                pubkey: Some(pubkey),
+                network: Some(network),
                 block_height: Some(0),
                 block_hash: None,
                 methods,
@@ -671,11 +702,24 @@ impl Handler for GetBalanceHandler {
     }
 
     fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let balance = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.sync_wallets().map_err(|e| NIP47Error {
+                code: ErrorCode::Other,
+                message: format!("ldk sync failed: {e}"),
+            })?;
+            ldk_service.get_balance_msat().map_err(|e| NIP47Error {
+                code: ErrorCode::Other,
+                message: format!("ldk balance failed: {e}"),
+            })?
+        } else {
+            0
+        };
+
         Ok(Response {
             result_type: Method::GetBalance,
             error: None,
             result: Some(ResponseResult::GetBalance(GetBalanceResponse {
-                balance: 0,
+                balance,
             })),
         })
     }
@@ -702,6 +746,25 @@ impl Handler for PayInvoiceHandler {
     }
 
     fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let (Some(ldk_service), RequestParams::PayInvoice(params)) =
+            (get_ldk_service(), &_req.params)
+        {
+            let payment = ldk_service
+                .pay_invoice(&params.invoice, params.amount)
+                .map_err(|e| NIP47Error {
+                    code: ErrorCode::PaymentFailed,
+                    message: format!("ldk pay_invoice failed: {e}"),
+                })?;
+            return Ok(Response {
+                result_type: Method::PayInvoice,
+                error: None,
+                result: Some(ResponseResult::PayInvoice(PayInvoiceResponse {
+                    preimage: payment.preimage,
+                    fees_paid: payment.fees_paid_msat,
+                })),
+            });
+        }
+
         Ok(Response {
             result_type: Method::PayInvoice,
             error: None,
@@ -740,6 +803,25 @@ impl Handler for PayKeysendHandler {
     }
 
     fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let (Some(ldk_service), RequestParams::PayKeysend(params)) =
+            (get_ldk_service(), &_req.params)
+        {
+            let payment = ldk_service
+                .pay_keysend(&params.pubkey, params.amount)
+                .map_err(|e| NIP47Error {
+                    code: ErrorCode::PaymentFailed,
+                    message: format!("ldk pay_keysend failed: {e}"),
+                })?;
+            return Ok(Response {
+                result_type: Method::PayKeysend,
+                error: None,
+                result: Some(ResponseResult::PayKeysend(PayKeysendResponse {
+                    preimage: payment.preimage,
+                    fees_paid: payment.fees_paid_msat,
+                })),
+            });
+        }
+
         Ok(Response {
             result_type: Method::PayKeysend,
             error: None,
@@ -772,6 +854,36 @@ impl Handler for MakeInvoiceHandler {
     }
 
     fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let (Some(ldk_service), RequestParams::MakeInvoice(params)) =
+            (get_ldk_service(), &_req.params)
+        {
+            let invoice = ldk_service
+                .make_invoice(
+                    params.amount,
+                    params.description.as_deref(),
+                    params.description_hash.as_deref(),
+                    params.expiry,
+                )
+                .map_err(|e| NIP47Error {
+                    code: ErrorCode::Other,
+                    message: format!("ldk make_invoice failed: {e}"),
+                })?;
+            return Ok(Response {
+                result_type: Method::MakeInvoice,
+                error: None,
+                result: Some(ResponseResult::MakeInvoice(MakeInvoiceResponse {
+                    invoice: invoice.invoice,
+                    payment_hash: invoice.payment_hash,
+                    description: params.description.clone(),
+                    description_hash: params.description_hash.clone(),
+                    preimage: None,
+                    amount: invoice.amount_msat,
+                    created_at: None,
+                    expires_at: invoice.expires_at.map(Into::into),
+                })),
+            });
+        }
+
         Ok(Response {
             result_type: Method::MakeInvoice,
             error: None,

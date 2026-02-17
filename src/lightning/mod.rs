@@ -1,5 +1,6 @@
 pub mod ldk_service;
 
 pub use ldk_service::{
-    LdkService, LdkServiceConfig, LdkServiceError, LdkServiceInitError,
+    LdkInvoiceResult, LdkPaymentResult, LdkService, LdkServiceConfig, LdkServiceError,
+    LdkServiceInitError,
 };
