@@ -1,5 +1,5 @@
 //! Validates zero-elapsed refill behavior.
-//! Success condition: refill at identical timestamp leaves balance unchanged.
+//! Success condition: phased refill+debit with zero debit at identical timestamp leaves balance unchanged.
 //! Failure condition: balance changes when elapsed time is zero.
 use crate::{rule, RateState};
 
@@ -7,7 +7,7 @@ use crate::{rule, RateState};
 fn elapsed_zero_no_refill_change() {
     let mut state = RateState::new(42, 100);
     state
-        .refill(100, &rule(1000, 1_000_000))
-        .expect("refill should work");
+        .withdraw_after_refill(0, 100, &rule(1000, 1_000_000))
+        .expect("phased refill should work");
     assert_eq!(state.balance(), 42);
 }

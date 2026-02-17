@@ -160,34 +160,4 @@ impl RateState {
         Ok(())
     }
 
-    #[deprecated(
-        note = "Use `check_withdraw_after_refill` for validation and `withdraw_after_refill` for execution-phase debit."
-    )]
-    pub(crate) fn refill(&mut self, now: u64, rule: &RateLimitRule) -> Result<(), RateStateError> {
-        self.balance = self.calculate_refill(now, rule)?;
-        Ok(())
-    }
-
-    #[deprecated(
-        note = "Use `check_withdraw_after_refill` and `withdraw_after_refill` in the phased accounting flow."
-    )]
-    pub(crate) fn withdraw(&mut self, amount: u64) -> Result<(), RateStateError> {
-        let amount_i64 =
-            i64::try_from(amount).map_err(|_| RateStateError::AmountTooLarge { amount })?;
-        if self.balance < amount_i64 {
-            return Err(RateStateError::InsufficientBalance);
-        }
-
-        self.balance = self.balance.saturating_sub(amount_i64);
-
-        Ok(())
-    }
-
-    #[deprecated(
-        note = "Negative balances are forbidden. Use `refund` or phased withdraw methods."
-    )]
-    pub(crate) fn withdraw_force(&mut self, amount: u64) {
-        let amount_i64 = i64::try_from(amount).unwrap_or(i64::MAX);
-        self.balance = self.balance.saturating_sub(amount_i64);
-    }
 }
