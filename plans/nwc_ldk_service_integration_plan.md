@@ -2,114 +2,84 @@
 
 ## Goal
 
-Integrate a single live `LdkService` instance into the NWC service so that NWC methods use real LDK state, starting with a first happy-path end-to-end test:
-
-1. Start regtest `bitcoind`.
-2. Start NWC service with live LDK wired to that `bitcoind`.
-3. Fund the LDK wallet and confirm on-chain.
-4. Call NWC `get_balance`.
-5. Verify returned balance reflects the funded amount.
+Run NWC on top of a single live `LdkService` and replace stubbed wallet actions with real LDK behavior, validated by regtest integration tests.
 
 ## Scope
 
 - LDK-only backend (no backend switch abstraction).
-- Preserve existing auth/rate/quota flow.
-- First milestone only requires live `get_info`/`get_balance`.
+- Keep current auth/rate/quota behavior unchanged.
+- Keep current NIP-47 method surface and fill it with real execution incrementally.
 
-## Step 1: Introduce `LdkService`
+## Progress (as of 2026-02-17)
 
-Create `src/lightning/ldk_service.rs` with a focused API around one `ldk_node::Node` instance.
+- [x] `LdkService` introduced and wired.
+- [x] Process-singleton LDK context added to NWC runtime.
+- [x] `get_info` uses live LDK node identity.
+- [x] `get_balance` uses live LDK wallet balance.
+- [x] Regtest integration suite scaffolded under `tests/nwc_ldk_integration/`.
+- [x] `get_balance_after_onchain_funding` integration test passes.
+- [x] `make_invoice` handler uses live LDK call.
+- [x] `pay_invoice` handler uses live LDK call.
+- [x] `pay_keysend` handler uses live LDK call.
+- [x] Phase-4 integration tests added:
+  - `make_invoice_happy_path`
+  - `pay_invoice_invalid_invoice_returns_error`
+  - `pay_keysend_invalid_pubkey_returns_error`
+- [x] Full `cargo test -- --nocapture` green in Docker-enabled run.
 
-### Responsibilities
+## Current Design Decisions
 
-- Build/start/stop node lifecycle.
-- Expose typed operations needed by handlers.
-- Surface stable service-level errors.
+- One `Arc<LdkService>` instance per process, shared across handlers.
+- On execution errors, existing refund-on-failure flow remains in place.
+- For now, deterministic per-handler error mapping is used (`PaymentFailed` for payment paths, `Other` elsewhere).
+- Cross-node channel/payment happy-path stays in `bitcoin_integration` for now; `nwc_ldk_integration` keeps deterministic tests.
 
-### Proposed API
+## Next Phases
 
-- `start_from_config(cfg: &Config) -> Result<Arc<LdkService>, LdkServiceInitError>`
-- `node_id() -> String`
-- `network() -> &'static str`
-- `sync_wallets() -> Result<(), LdkServiceError>`
-- `get_balance_msat() -> Result<u64, LdkServiceError>`
-- `new_onchain_address() -> Result<String, LdkServiceError>` (test/internal helper)
-- `stop() -> Result<(), LdkServiceError>`
+### Phase 5: Centralize LDK -> NIP47 Error Mapping
 
-## Step 2: Add Config Fields
+1. Add one helper used by all LDK-backed handlers (likely in `src/lib.rs` or `src/lightning/`).
+2. Normalize mapping for:
+   - parse/validation errors
+   - payment execution failures
+   - transient service errors
+3. Update `MakeInvoiceHandler`, `PayInvoiceHandler`, `PayKeysendHandler` to use helper.
+4. Add focused tests asserting stable error codes/messages.
 
-Extend config parsing/types with required LDK+bitcoind settings:
+### Phase 6: Strengthen Payment Coverage
 
-- `network` (regtest)
-- `bitcoind_rpc_host`
-- `bitcoind_rpc_port`
-- `bitcoind_rpc_user`
-- `bitcoind_rpc_password`
-- `ldk_storage_dir`
-- optional `ldk_listen_addr`
+1. Add stable NWC-level negative-path tests for:
+   - invalid amount
+   - malformed destination pubkey
+   - malformed invoice
+2. Keep heavy cross-node success flow in `bitcoin_integration` (already present and passing).
+3. Optionally add one NWC happy-path payment test if startup/channel reliability can be made deterministic.
 
-Add startup validation with clear error messages for missing/invalid fields.
+### Phase 7: Cleanup and Hardening
 
-## Step 3: Wire a Process-Singleton `LdkService`
+1. Remove remaining legacy stub branches that are no longer needed.
+2. Review and trim dead code warnings.
+3. Document runtime requirements (Docker/regtest) for integration tests in project docs.
 
-Initialize one `Arc<LdkService>` at startup and pass it through service context.
+### Phase 8: Hold Invoice Support
 
-### Requirements
+1. Wire `make_hold_invoice` to live LDK behavior.
+2. Wire `settle_hold_invoice` to live LDK behavior.
+3. Wire `cancel_hold_invoice` to live LDK behavior.
+4. Centralize error mapping for hold-invoice paths (invalid hash/preimage, unknown invoice, invalid state transitions).
+5. Add integration tests in `tests/nwc_ldk_integration/` covering:
+   - create hold invoice success
+   - settle hold invoice success
+   - cancel hold invoice success
+   - negative cases (unknown payment hash, double settle/cancel, invalid transition)
+6. Remove hold-invoice stub fallback branches once live wiring is stable and test-covered.
 
-- Created once in `main` before request handling starts.
-- Shared by all NWC handlers via context.
-- Stopped once during shutdown.
+## Validation Command
 
-## Step 4: Hook `LdkService` into NWC Handlers
-
-Replace dummy handler responses with live LDK data for the first methods:
-
-- `GetInfo`: use live `node_id` and `network`.
-- `GetBalance`: return live wallet balance in msat.
-
-Keep access control + rate/quota checks unchanged and before execution.
-
-## Step 5: Centralize Error Mapping
-
-Map `LdkServiceError` to `NIP47Error` in one place.
-
-- Use deterministic `ErrorCode::Other` for internal/service failures in first phase.
-- Keep existing refund-on-execution-failure behavior intact.
-
-## Step 6: Add NWC+LDK Integration Test Suite
-
-Create separate test target:
-
-- `tests/nwc_ldk_integration.rs`
-- `tests/nwc_ldk_integration/mod.rs`
-- `tests/nwc_ldk_integration/get_balance_after_onchain_funding.rs`
-
-Reuse existing regtest harness (`tests/common/bitcoind.rs`).
-
-## Step 7: First Happy-Path Test Case
-
-`get_balance_after_onchain_funding`:
-
-1. Start bitcoind (regtest).
-2. Start NWC service configured with live `LdkService`.
-3. Obtain LDK on-chain address.
-4. Send 1 BTC from bitcoind to that address.
-5. Mine confirmation block(s).
-6. Sync/wait until LDK reflects funds.
-7. Send NWC `get_balance` request.
-8. Assert returned msat is expected (exact or lower-bounded by expected policy).
-
-## Step 8: Validation
-
-Run in order:
-
-1. `cargo test --test nwc_ldk_integration get_balance_after_onchain_funding -- --nocapture`
-2. `cargo test --test bitcoin_integration -- --nocapture`
-3. `cargo test -- --nocapture`
+- `cargo test -- --nocapture`
 
 ## Done Criteria
 
-- NWC process starts with exactly one live `LdkService`.
-- `get_info` and `get_balance` use real LDK data.
-- First happy-path test passes reliably on regtest.
-- Existing test suites remain green.
+- NWC runtime is fully backed by live `LdkService` for implemented methods.
+- Error behavior is consistent and test-covered.
+- Regtest integration suites stay green and deterministic enough for CI/local usage.
