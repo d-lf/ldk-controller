@@ -113,6 +113,11 @@ pub fn clear_usage_profiles() {
     usage_profile::clear_all_usage_profiles_and_states();
 }
 
+#[doc(hidden)]
+pub fn clear_access_states_for_testing() {
+    usage_profile::service::clear_all_access_states();
+}
+
 struct StateUpdateRequest {
     key: AccessKey,
     rule: RateLimitRule,
