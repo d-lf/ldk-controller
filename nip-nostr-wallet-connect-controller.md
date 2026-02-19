@@ -43,7 +43,7 @@ Generation:
 - The owner constructs a parameterized replaceable event (kind `30078`).
 - The event `pubkey` is the owner's pubkey.
 - The event `content` is the JSON-encoded `UsageProfile`.
-- The event includes a `d` tag whose value is `relay_pubkey:user_pubkey` (the relay being targeted and the user being
+- The event includes a `d` tag whose value is `node_pubkey:user_pubkey` (the node being targeted and the user being
   granted access).
 - The event `tags` MUST include a `p` tag with the relay's pubkey so the relay receives it.
 - The event `tags` MAY include auxiliary metadata (e.g., label, scope, or policy identifiers).
@@ -134,7 +134,7 @@ Steps:
 2. If the caller pubkey is in the owner list, authorization succeeds immediately.
 3. Look up the latest access grant event of kind `30078` with:
     - `pubkey` = owner pubkey
-    - `d` tag = `relay_pubkey:user_pubkey`
+    - `d` tag = `node_pubkey:user_pubkey`
 4. Parse the event `content` as a `UsageProfile`. If parsing fails, deny access.
 5. Enforce the limits in the `UsageProfile` against the caller's access state.
 6. Execute the method.
@@ -144,7 +144,7 @@ Steps:
 
 ##### Step 1: Resolve the Grant
 
-1. Resolve the caller's latest `UsageProfile` grant (kind `30078`) for `d = relay_pubkey:user_pubkey`. If missing, deny
+1. Resolve the caller's latest `UsageProfile` grant (kind `30078`) for `d = node_pubkey:user_pubkey`. If missing, deny
    access with `UNAUTHORIZED`.
 2. Parse the grant content as `UsageProfile`. If parsing fails, deny access with `UNAUTHORIZED`.
 

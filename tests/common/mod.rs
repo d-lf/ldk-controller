@@ -46,12 +46,12 @@ pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
 pub async fn grant_usage_profile(
     owner_keys: &Keys,
     relay_url: &str,
-    relay_pubkey: PublicKey,
+    node_pubkey: PublicKey,
     target_pubkey: PublicKey,
     profile: &UsageProfile,
 ) -> Result<()> {
     let content = serde_json::to_string(profile).expect("serialize UsageProfile");
-    let d_value = format!("{}:{}", relay_pubkey, target_pubkey);
+    let d_value = format!("{}:{}", node_pubkey, target_pubkey);
 
     let owner_client = Client::builder().signer(owner_keys.clone()).build();
     owner_client.add_relay(relay_url).await?;
@@ -60,7 +60,7 @@ pub async fn grant_usage_profile(
 
     let grant_event = EventBuilder::new(Kind::Custom(30078), content)
         .tag(Tag::parse(["d", d_value.as_str()]).expect("create d tag"))
-        .tag(Tag::public_key(relay_pubkey));
+        .tag(Tag::public_key(node_pubkey));
     owner_client.send_event_builder(grant_event).await?;
 
     Ok(())

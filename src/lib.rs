@@ -84,7 +84,12 @@ fn parse_grant_target(event: &Event) -> Option<String> {
         }
     })?;
     let mut parts = d_tag.splitn(2, ':');
-    let _relay_pubkey = parts.next()?;
+    let node_pubkey = parts.next()?;
+    if let Some(configured_node_pubkey) = RELAY_PUBKEY.get() {
+        if node_pubkey != configured_node_pubkey.to_string() {
+            return None;
+        }
+    }
     let user_pubkey = parts.next()?;
     if user_pubkey.is_empty() {
         None
