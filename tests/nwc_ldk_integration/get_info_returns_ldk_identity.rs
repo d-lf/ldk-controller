@@ -90,6 +90,7 @@ async fn get_info_returns_ldk_identity() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: None,
+        control: None,
     };
     let owner_keys = Keys::generate();
     grant_usage_profile(

@@ -90,6 +90,7 @@ async fn pay_invoice_invalid_invoice_returns_error() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: None,
+        control: None,
     };
     let owner_keys = Keys::generate();
     grant_usage_profile(

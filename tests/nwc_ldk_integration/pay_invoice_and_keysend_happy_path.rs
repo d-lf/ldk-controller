@@ -210,6 +210,7 @@ async fn pay_invoice_and_keysend_happy_path() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: None,
+        control: None,
     };
     let owner_keys = Keys::generate();
     grant_usage_profile(

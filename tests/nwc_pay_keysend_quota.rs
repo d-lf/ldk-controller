@@ -51,6 +51,7 @@ async fn test_nwc_pay_keysend_quota_exceeded_after_one_call() -> Result<()> {
             max_capacity: 1_000_000,
         }),
         methods: Some(methods),
+        control: None,
     };
     let owner_keys = Keys::generate();
     grant_usage_profile(

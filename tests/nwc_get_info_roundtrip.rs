@@ -56,6 +56,7 @@ async fn test_nwc_get_info_roundtrip() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: Some(methods),
+        control: None,
     };
     let owner_keys = Keys::generate();
     grant_usage_profile(

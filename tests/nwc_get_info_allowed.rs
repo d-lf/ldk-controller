@@ -37,6 +37,7 @@ async fn test_nwc_get_info_allowed_for_method_access() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: Some(methods),
+        control: None,
     };
     let owner_keys = Keys::generate();
     grant_usage_profile(

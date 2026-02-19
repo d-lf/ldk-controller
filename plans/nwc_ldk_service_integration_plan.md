@@ -34,6 +34,11 @@ Run NWC on top of a single live `LdkService` and replace stubbed wallet actions 
   - `pay_keysend_zero_amount_returns_error`
   - `pay_invoice_zero_amount_returns_error`
   - `pay_invoice` validation rejects `amount=0`
+- [x] Phase-9.2 protocol routing added:
+  - control request kind `23196`, control response kind `23197`
+  - separate control dispatcher using same NIP-04 transport pipeline
+  - deterministic errors for unknown/malformed control requests
+  - control roundtrip integration tests
 - [x] Full `cargo test -- --nocapture` green in Docker-enabled run.
 
 ## Current Design Decisions
@@ -69,6 +74,7 @@ Run NWC on top of a single live `LdkService` and replace stubbed wallet actions 
 1. Remove remaining legacy stub branches that are no longer needed.
 2. Review and trim dead code warnings.
 3. Document runtime requirements (Docker/regtest) for integration tests in project docs.
+4. Update grant identity key format from `d = relay_pubkey:user_pubkey` to `d = node_pubkey:user_pubkey` across docs, publishing, and grant lookup logic.
 
 ### Phase 8: Hold Invoice Support
 
@@ -82,6 +88,60 @@ Run NWC on top of a single live `LdkService` and replace stubbed wallet actions 
    - cancel hold invoice success
    - negative cases (unknown payment hash, double settle/cancel, invalid transition)
 6. Remove hold-invoice stub fallback branches once live wiring is stable and test-covered.
+
+### Phase 9: Control Kind + `control` Profile Section
+
+1. Extend `UsageProfile` with optional `control` map for admin/control methods.
+2. Add a separate control request/response `Kind` pair while reusing current NWC transport/encryption pipeline.
+3. Implement control authorization rules:
+   - missing `control` => deny all control methods
+   - empty `control` => deny all control methods
+   - method must exist explicitly in `control`
+4. Keep wallet-method authorization unchanged under `methods`.
+5. Add admin handler registry for control methods (`connect_peer`, `open_channel`, `close_channel`, `list_channels`, `get_channel`, `list_peers`, `disconnect_peer`).
+6. Add integration tests for:
+   - control method denied when `control` missing
+   - control method denied when not explicitly listed
+   - control method allowed when explicitly listed
+7. Update grant identity key task in same stream: change `d` tag format from `relay_pubkey:user_pubkey` to `node_pubkey:user_pubkey` if not already completed.
+
+#### Phase 9.1 Status: Done
+
+- `UsageProfile` now contains optional `control` section.
+- Existing profile literals/tests updated with `control: None`.
+
+#### Phase 9.2 Status: Done
+
+- Control transport is live on custom kinds:
+  - request: `Kind::Custom(23196)`
+  - response: `Kind::Custom(23197)`
+- Control requests are decrypted and routed through a dedicated dispatcher.
+- Current control handlers are protocol-ready and return deterministic `NOT_IMPLEMENTED` until method wiring is added.
+- Integration coverage added in `tests/control_kind_roundtrip.rs`.
+
+#### Phase 9.3 Status: Done
+
+- Control authorization now enforced from `UsageProfile.control`.
+- Policy implemented:
+  - missing `control` => deny (`RESTRICTED`)
+  - empty `control` => deny (`RESTRICTED`)
+  - method not explicitly listed => deny (`RESTRICTED`)
+  - listed method => proceeds to control dispatcher
+- Integration coverage in `tests/control_kind_roundtrip.rs`:
+  - `control_denied_when_control_missing`
+  - `control_denied_when_method_not_listed`
+  - `control_allowed_when_method_listed_returns_channels_array`
+
+#### Phase 9.4 Status: Done (`list_channels`)
+
+- First real control method wired: `list_channels`.
+- `LdkService` now exposes typed channel summaries.
+- Control dispatcher now returns:
+  - `error: null`
+  - `result: [ ...channels ]`
+  for authorized `list_channels` requests.
+- Integration coverage updated:
+  - `control_allowed_when_method_listed_returns_channels_array`
 
 ## Validation Command
 

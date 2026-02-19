@@ -1,6 +1,8 @@
 use crate::state::rate_state::RateState;
 use crate::state::store::{get_access_rate_state, get_quota_state, AccessKey};
 use nostr_sdk::prelude::*;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
     CancelHoldInvoiceResponse, ErrorCode, GetBalanceResponse, GetInfoResponse,
@@ -36,6 +38,9 @@ static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 static APPLIED_GRANT_EVENTS: OnceLock<RwLock<HashMap<String, AppliedGrantEvent>>> = OnceLock::new();
 static FORCED_EXECUTE_FAILURES: OnceLock<RwLock<HashSet<Method>>> = OnceLock::new();
 static LDK_SERVICE: OnceLock<RwLock<Option<Arc<LdkService>>>> = OnceLock::new();
+
+pub const CONTROL_REQUEST_KIND: u16 = 23196;
+pub const CONTROL_RESPONSE_KIND: u16 = 23197;
 
 #[derive(Clone)]
 struct AppliedGrantEvent {
@@ -534,6 +539,36 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::SettleHoldInvoice,
 ];
 
+const SUPPORTED_CONTROL_METHODS: &[&str] = &[
+    "connect_peer",
+    "open_channel",
+    "close_channel",
+    "list_channels",
+    "get_channel",
+    "list_peers",
+    "disconnect_peer",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControlRequest {
+    method: String,
+    #[serde(default)]
+    params: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControlError {
+    code: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControlResponse {
+    result_type: String,
+    result: Option<Value>,
+    error: Option<ControlError>,
+}
+
 /// Starts a NWC (Nostr Wallet Connect) service that listens for NIP-47
 /// requests and responds to them.
 ///
@@ -559,11 +594,17 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
 
     let our_pubkey = keys.public_key();
 
-    // Subscribe to NWC requests addressed to us (p-tagged with our pubkey)
-    let filter = Filter::new()
+    // Subscribe to wallet requests addressed to us (p-tagged with our pubkey)
+    let wallet_filter = Filter::new()
         .kind(Kind::WalletConnectRequest)
         .pubkey(our_pubkey);
-    client.subscribe(filter).await?;
+    client.subscribe(wallet_filter).await?;
+
+    // Subscribe to control requests addressed to us (p-tagged with our pubkey)
+    let control_filter = Filter::new()
+        .kind(Kind::Custom(CONTROL_REQUEST_KIND))
+        .pubkey(our_pubkey);
+    client.subscribe(control_filter).await?;
 
     // Subscribe to access grant updates (Kind 30078).
     let grants_filter = if let Some(relay_pubkey) = RELAY_PUBKEY.get() {
@@ -610,33 +651,33 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
         while let Some(notification) = notifications.next().await {
             if let ClientNotification::Event { event, .. } = notification {
                 let event = event.as_ref();
-                match event.kind {
-                    Kind::WalletConnectRequest => {
-                        if let Err(e) = handle_nwc_request(&client_clone, &keys, event).await {
-                            eprintln!("Failed to handle NWC request: {}", e);
-                        }
+                if event.kind == Kind::WalletConnectRequest {
+                    if let Err(e) = handle_nwc_request(&client_clone, &keys, event).await {
+                        eprintln!("Failed to handle NWC request: {}", e);
                     }
-                    Kind::Custom(30078) => {
-                        if let Some(target_pubkey) = parse_grant_target(event) {
-                            if !should_apply_grant_event(&target_pubkey, event) {
-                                continue;
-                            }
-                            match serde_json::from_str::<UsageProfile>(&event.content) {
-                                Ok(profile) => {
-                                    usage_profile::upsert_usage_profile_and_reset_states(
-                                        &target_pubkey,
-                                        profile,
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to parse UsageProfile: {}", e);
-                                }
-                            }
-                        } else {
-                            eprintln!("Access grant event missing or invalid d tag");
-                        }
+                } else if event.kind == Kind::Custom(CONTROL_REQUEST_KIND) {
+                    if let Err(e) = handle_control_request(&client_clone, &keys, event).await {
+                        eprintln!("Failed to handle control request: {}", e);
                     }
-                    _ => {}
+                } else if event.kind == Kind::Custom(30078) {
+                    if let Some(target_pubkey) = parse_grant_target(event) {
+                        if !should_apply_grant_event(&target_pubkey, event) {
+                            continue;
+                        }
+                        match serde_json::from_str::<UsageProfile>(&event.content) {
+                            Ok(profile) => {
+                                usage_profile::upsert_usage_profile_and_reset_states(
+                                    &target_pubkey,
+                                    profile,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to parse UsageProfile: {}", e);
+                            }
+                        }
+                    } else {
+                        eprintln!("Access grant event missing or invalid d tag");
+                    }
                 }
             }
         }
@@ -1212,5 +1253,110 @@ async fn handle_nwc_request(
 
     client.send_event_builder(response_event).await?;
 
+    Ok(())
+}
+
+fn control_error(code: &str, message: String) -> ControlError {
+    ControlError {
+        code: code.to_string(),
+        message,
+    }
+}
+
+fn authorize_control_method(caller_pubkey: &str, method: &str) -> Result<(), ControlError> {
+    let profile = get_usage_profile(caller_pubkey)
+        .ok_or_else(|| control_error("UNAUTHORIZED", "unauthorized".to_string()))?;
+
+    let Some(control_methods) = profile.control else {
+        return Err(control_error(
+            "RESTRICTED",
+            "control access denied, missing control permissions".to_string(),
+        ));
+    };
+
+    if control_methods.is_empty() || !control_methods.contains_key(method) {
+        return Err(control_error(
+            "RESTRICTED",
+            "control access denied, insufficient permission".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> ControlResponse {
+    let method = request.method.clone();
+
+    if let Err(error) = authorize_control_method(caller_pubkey, &request.method) {
+        return ControlResponse {
+            result_type: method,
+            result: None,
+            error: Some(error),
+        };
+    }
+
+    if !SUPPORTED_CONTROL_METHODS
+        .iter()
+        .any(|method| *method == request.method)
+    {
+        return ControlResponse {
+            result_type: request.method.clone(),
+            result: None,
+            error: Some(control_error(
+                "NOT_IMPLEMENTED",
+                format!("unknown control method: {}", request.method),
+            )),
+        };
+    }
+
+    if request.method == "list_channels" {
+        let channels = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.list_channels()
+        } else {
+            Vec::new()
+        };
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(serde_json::to_value(channels).unwrap_or(Value::Array(Vec::new()))),
+            error: None,
+        };
+    }
+
+    ControlResponse {
+        result_type: request.method,
+        result: None,
+        error: Some(control_error(
+            "NOT_IMPLEMENTED",
+            "control method not implemented yet".to_string(),
+        )),
+    }
+}
+
+async fn handle_control_request(
+    client: &Client,
+    keys: &Keys,
+    event: &Event,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sender_pubkey = event.pubkey;
+    let decrypted = nip04::decrypt(keys.secret_key(), &sender_pubkey, &event.content)?;
+
+    let response = match serde_json::from_str::<ControlRequest>(&decrypted) {
+        Ok(request) => process_control_request(request, &sender_pubkey.to_string()),
+        Err(e) => ControlResponse {
+            result_type: "unknown".to_string(),
+            result: None,
+            error: Some(control_error(
+                "OTHER",
+                format!("invalid control request payload: {e}"),
+            )),
+        },
+    };
+
+    let response_json = serde_json::to_string(&response)?;
+    let encrypted = nip04::encrypt(keys.secret_key(), &sender_pubkey, response_json)?;
+    let response_event = EventBuilder::new(Kind::Custom(CONTROL_RESPONSE_KIND), encrypted)
+        .tag(Tag::public_key(sender_pubkey))
+        .tag(Tag::event(event.id));
+    client.send_event_builder(response_event).await?;
     Ok(())
 }

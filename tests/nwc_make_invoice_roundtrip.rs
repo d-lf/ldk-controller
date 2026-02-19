@@ -38,6 +38,7 @@ async fn test_nwc_make_invoice_roundtrip() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: Some(methods),
+        control: None,
     };
     let owner_keys = Keys::generate();
     grant_usage_profile(

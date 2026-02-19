@@ -46,6 +46,7 @@ async fn test_nwc_get_info_rate_limited_after_one_call() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: Some(methods),
+        control: None,
     };
     let owner_keys = Keys::generate();
     grant_usage_profile(

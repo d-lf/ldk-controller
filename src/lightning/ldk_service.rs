@@ -5,6 +5,7 @@ use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{Builder, Node};
+use serde::Serialize;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -138,6 +139,12 @@ pub struct LdkInvoiceResult {
     pub payment_hash: Option<String>,
     pub amount_msat: Option<u64>,
     pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LdkChannelInfo {
+    pub counterparty_pubkey: String,
+    pub is_channel_ready: bool,
 }
 
 impl LdkService {
@@ -345,6 +352,17 @@ impl LdkService {
             .list_channels()
             .iter()
             .any(|c| c.counterparty_node_id == counterparty)
+    }
+
+    pub fn list_channels(&self) -> Vec<LdkChannelInfo> {
+        self.node
+            .list_channels()
+            .iter()
+            .map(|channel| LdkChannelInfo {
+                counterparty_pubkey: channel.counterparty_node_id.to_string(),
+                is_channel_ready: channel.is_channel_ready,
+            })
+            .collect()
     }
 
     fn wait_for_outbound_payment(

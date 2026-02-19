@@ -70,7 +70,14 @@ The `UsageProfile` defines per-controller permissions and limits. All numeric va
         "rate_per_micro": 10,
         "max_capacity": 1000
       }
-    }
+    },
+    "pay_invoice": {}
+  },
+  "control": {
+    "connect_peer": {},
+    "open_channel": {},
+    "close_channel": {},
+    "list_channels": {}
   },
   "quota": {
     "rate_per_micro": 1,
@@ -84,7 +91,14 @@ Fields:
 - `methods` (object, optional): Map of method name to a `MethodAccessRule`.
     - Missing `methods` means no restrictions apply to the user.
     - An empty `methods` object means the user has no method permissions.
+- `control` (object, optional): Map of controller/admin method name to a `MethodAccessRule`.
+    - Missing `control` means no control permissions are granted.
+    - An empty `control` object means no control permissions are granted.
+    - A control method MUST be explicitly present to be allowed.
 - `methods.<method>.rate` (object, optional): Per-method rate limit, if missing no rate limit is applied.
+    - `rate_per_micro` (u64, optional): Tokens refilled per microsecond. Default `0`.
+    - `max_capacity` (u64, optional): Maximum token capacity. Default `u64::MAX`.
+- `control.<method>.rate` (object, optional): Per-control-method rate limit, if missing no rate limit is applied.
     - `rate_per_micro` (u64, optional): Tokens refilled per microsecond. Default `0`.
     - `max_capacity` (u64, optional): Maximum token capacity. Default `u64::MAX`.
 - `quota` (object, optional): Controller-wide spend quota, if missing no quota is applied.
@@ -103,6 +117,7 @@ Defaults:
 3. **Authorize**: Check whether the controller pubkey is permitted to call the method. Authorization is based on:
     - Ownership: Owners bypass access checks.
     - Method permissions: A controller must have an explicit permission entry for the method to proceed.
+    - Control permissions: For control-kind events, a controller must have an explicit entry in `control`.
 4. **Enforce Limits**: Apply rate and quota checks using the controller's access state.
     - Limits are evaluated without mutating state first.
     - If any check fails (missing permission, insufficient rate, insufficient quota), return an error response.
@@ -139,6 +154,13 @@ Steps:
 2. If `methods` is present and empty, deny access with `RESTRICTED`.
 3. If `methods` is present and the requested method is missing, deny access with `RESTRICTED`.
 
+##### Step 2b: Control Method Authorization (control kind only)
+
+1. Read `control`.
+2. If `control` does not exist, deny access with `RESTRICTED`.
+3. If `control` is present and empty, deny access with `RESTRICTED`.
+4. If requested control method is missing from `control`, deny access with `RESTRICTED`.
+
 ##### Step 3: Rate Limit (only if methods are restricted)
 
 1. Read the rate limit rule for the requested method.
@@ -172,8 +194,10 @@ Steps:
 
 | Kind  | Description        |
 |-------|--------------------|
-| XXXXX | Controller Request |
-| XXXXX | Node Response      |
+| 23194 | Wallet Request (NWC-compatible methods) |
+| 23195 | Wallet Response     |
+| 23196 | Control Request (admin/channel methods) |
+| 23197 | Control Response    |
 
 ## Request Format
 
@@ -198,6 +222,22 @@ Requests are NIP-44 encrypted JSON-RPC payloads:
 | `open_channel`  | Open a new channel        |
 | `close_channel` | Close an existing channel |
 | `list_payments` | List payment history      |
+
+### Admin / Channel Management Methods
+
+The following controller methods are intended for node administration and channel lifecycle operations:
+
+1. `connect_peer(pubkey, host, port)`
+2. `open_channel(pubkey, host, port, capacity_sats, push_msat?)`
+3. `close_channel(channel_id, force?)`
+4. `list_channels()`
+5. `get_channel(channel_id)`
+6. `list_peers()`
+7. `disconnect_peer(pubkey)`
+
+Optional async operation tracking:
+
+8. `get_operation_status(operation_id)` where mutating methods (e.g. `open_channel`, `close_channel`) return an `operation_id`.
 
 ## Response Format
 

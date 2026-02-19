@@ -22,6 +22,7 @@ fn usage_profile_json_roundtrip() {
             max_capacity: 2_000_000,
         }),
         methods: Some(methods),
+        control: None,
     };
 
     let json = serde_json::to_string(&profile).expect("serialize UsageProfile");

@@ -21,4 +21,5 @@ pub struct MethodAccessRule {
 pub struct UsageProfile {
     pub quota: Option<RateLimitRule>,
     pub methods: Option<HashMap<Method, MethodAccessRule>>,
+    pub control: Option<HashMap<String, MethodAccessRule>>,
 }

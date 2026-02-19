@@ -36,6 +36,7 @@ async fn test_get_info_with_granted_profile() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: Some(methods),
+        control: None,
     };
     let owner_keys = Keys::generate();
     grant_usage_profile(&owner_keys, &relay_url, relay_pubkey, user_pubkey, &profile).await?;

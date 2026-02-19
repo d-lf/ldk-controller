@@ -73,6 +73,7 @@ async fn profile_update_resets_counters() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: Some(methods),
+        control: None,
     };
 
     let owner_keys = Keys::generate();

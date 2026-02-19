@@ -100,6 +100,7 @@ async fn get_balance_after_onchain_funding() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: None,
+        control: None,
     };
     let owner_keys = Keys::generate();
     grant_usage_profile(

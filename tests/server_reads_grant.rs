@@ -33,6 +33,7 @@ async fn test_server_reads_usage_profile_grant() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: Some(methods),
+        control: None,
     };
     grant_usage_profile(&owner_keys, &relay_url, relay_pubkey, user_pubkey, &profile).await?;
 

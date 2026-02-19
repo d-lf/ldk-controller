@@ -75,6 +75,7 @@ async fn concurrent_same_key_one_succeeds() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: Some(methods),
+        control: None,
     };
     grant_usage_profile(&owner_keys, &relay_url, relay_pubkey, user_pubkey, &profile).await?;
 

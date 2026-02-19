@@ -90,6 +90,7 @@ async fn make_invoice_invalid_description_hash_returns_error() -> Result<()> {
     let profile = UsageProfile {
         quota: None,
         methods: None,
+        control: None,
     };
     let owner_keys = Keys::generate();
     grant_usage_profile(
