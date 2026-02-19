@@ -97,6 +97,7 @@ pub enum LdkServiceError {
     InvalidPubkey(String),
     InvalidAmount(u64),
     ChannelFailed(String),
+    PeerFailed(String),
     PaymentFailed(String),
     StopFailed(String),
 }
@@ -116,6 +117,7 @@ impl fmt::Display for LdkServiceError {
             Self::InvalidPubkey(msg) => write!(f, "invalid pubkey: {msg}"),
             Self::InvalidAmount(amount) => write!(f, "invalid amount: {amount}"),
             Self::ChannelFailed(msg) => write!(f, "channel operation failed: {msg}"),
+            Self::PeerFailed(msg) => write!(f, "peer operation failed: {msg}"),
             Self::PaymentFailed(msg) => write!(f, "payment failed: {msg}"),
             Self::StopFailed(msg) => write!(f, "ldk node stop failed: {msg}"),
         }
@@ -143,8 +145,17 @@ pub struct LdkInvoiceResult {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LdkChannelInfo {
+    pub channel_id: String,
     pub counterparty_pubkey: String,
     pub is_channel_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LdkPeerInfo {
+    pub node_id: String,
+    pub address: String,
+    pub is_persisted: bool,
+    pub is_connected: bool,
 }
 
 impl LdkService {
@@ -328,6 +339,30 @@ impl LdkService {
         Ok(())
     }
 
+    pub fn connect_peer(
+        &self,
+        counterparty_pubkey: &str,
+        counterparty_addr: &str,
+    ) -> Result<(), LdkServiceError> {
+        let node_id = PublicKey::from_str(counterparty_pubkey)
+            .map_err(|e| LdkServiceError::InvalidPubkey(e.to_string()))?;
+        let addr = SocketAddress::from_str(counterparty_addr)
+            .map_err(|e| LdkServiceError::PeerFailed(e.to_string()))?;
+        self.node
+            .connect(node_id, addr, true)
+            .map_err(|e| LdkServiceError::PeerFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn disconnect_peer(&self, counterparty_pubkey: &str) -> Result<(), LdkServiceError> {
+        let node_id = PublicKey::from_str(counterparty_pubkey)
+            .map_err(|e| LdkServiceError::InvalidPubkey(e.to_string()))?;
+        self.node
+            .disconnect(node_id)
+            .map_err(|e| LdkServiceError::PeerFailed(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn stop(&self) -> Result<(), LdkServiceError> {
         self.node
             .stop()
@@ -359,8 +394,60 @@ impl LdkService {
             .list_channels()
             .iter()
             .map(|channel| LdkChannelInfo {
+                channel_id: channel.channel_id.to_string(),
                 counterparty_pubkey: channel.counterparty_node_id.to_string(),
                 is_channel_ready: channel.is_channel_ready,
+            })
+            .collect()
+    }
+
+    pub fn get_channel(&self, channel_id: &str) -> Option<LdkChannelInfo> {
+        self.node
+            .list_channels()
+            .iter()
+            .find(|channel| channel.channel_id.to_string() == channel_id)
+            .map(|channel| LdkChannelInfo {
+                channel_id: channel.channel_id.to_string(),
+                counterparty_pubkey: channel.counterparty_node_id.to_string(),
+                is_channel_ready: channel.is_channel_ready,
+            })
+    }
+
+    pub fn close_channel(&self, channel_id: &str, force: bool) -> Result<(), LdkServiceError> {
+        let details = self
+            .node
+            .list_channels()
+            .into_iter()
+            .find(|channel| channel.channel_id.to_string() == channel_id)
+            .ok_or_else(|| {
+                LdkServiceError::ChannelFailed(format!("channel not found: {channel_id}"))
+            })?;
+
+        if force {
+            self.node
+                .force_close_channel(
+                    &details.user_channel_id,
+                    details.counterparty_node_id,
+                    Some("closed via control API".to_string()),
+                )
+                .map_err(|e| LdkServiceError::ChannelFailed(e.to_string()))?;
+        } else {
+            self.node
+                .close_channel(&details.user_channel_id, details.counterparty_node_id)
+                .map_err(|e| LdkServiceError::ChannelFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn list_peers(&self) -> Vec<LdkPeerInfo> {
+        self.node
+            .list_peers()
+            .iter()
+            .map(|peer| LdkPeerInfo {
+                node_id: peer.node_id.to_string(),
+                address: peer.address.to_string(),
+                is_persisted: peer.is_persisted,
+                is_connected: peer.is_connected,
             })
             .collect()
     }

@@ -2,7 +2,7 @@ use crate::state::rate_state::RateState;
 use crate::state::store::{get_access_rate_state, get_quota_state, AccessKey};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
     CancelHoldInvoiceResponse, ErrorCode, GetBalanceResponse, GetInfoResponse,
@@ -554,6 +554,40 @@ struct ControlRequest {
     method: String,
     #[serde(default)]
     params: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenChannelParams {
+    pubkey: String,
+    host: String,
+    port: u16,
+    capacity_sats: u64,
+    #[serde(default)]
+    push_msat: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConnectPeerParams {
+    pubkey: String,
+    host: String,
+    port: u16,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DisconnectPeerParams {
+    pubkey: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GetChannelParams {
+    channel_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CloseChannelParams {
+    channel_id: String,
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1309,6 +1343,148 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
     }
 
+    if request.method == "open_channel" {
+        let params = match serde_json::from_value::<OpenChannelParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid open_channel params: {e}"),
+                    )),
+                };
+            }
+        };
+        if params.capacity_sats == 0 {
+            return ControlResponse {
+                result_type: "open_channel".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "capacity_sats must be greater than 0".to_string(),
+                )),
+            };
+        }
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "open_channel".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "ldk service unavailable".to_string(),
+                )),
+            };
+        };
+
+        let address = format!("{}:{}", params.host, params.port);
+        if let Err(e) = ldk_service.open_channel(
+            &params.pubkey,
+            &address,
+            params.capacity_sats,
+            params.push_msat,
+        ) {
+            return ControlResponse {
+                result_type: "open_channel".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    format!("open_channel failed: {e}"),
+                )),
+            };
+        }
+
+        return ControlResponse {
+            result_type: "open_channel".to_string(),
+            result: Some(json!({ "status": "accepted" })),
+            error: None,
+        };
+    }
+
+    if request.method == "connect_peer" {
+        let params = match serde_json::from_value::<ConnectPeerParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid connect_peer params: {e}"),
+                    )),
+                };
+            }
+        };
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "connect_peer".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "ldk service unavailable".to_string(),
+                )),
+            };
+        };
+        let address = format!("{}:{}", params.host, params.port);
+        if let Err(e) = ldk_service.connect_peer(&params.pubkey, &address) {
+            return ControlResponse {
+                result_type: "connect_peer".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    format!("connect_peer failed: {e}"),
+                )),
+            };
+        }
+        return ControlResponse {
+            result_type: "connect_peer".to_string(),
+            result: Some(json!({ "status": "connected" })),
+            error: None,
+        };
+    }
+
+    if request.method == "disconnect_peer" {
+        let params = match serde_json::from_value::<DisconnectPeerParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid disconnect_peer params: {e}"),
+                    )),
+                };
+            }
+        };
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "disconnect_peer".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "ldk service unavailable".to_string(),
+                )),
+            };
+        };
+        if let Err(e) = ldk_service.disconnect_peer(&params.pubkey) {
+            return ControlResponse {
+                result_type: "disconnect_peer".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    format!("disconnect_peer failed: {e}"),
+                )),
+            };
+        }
+        return ControlResponse {
+            result_type: "disconnect_peer".to_string(),
+            result: Some(json!({ "status": "disconnected" })),
+            error: None,
+        };
+    }
+
     if request.method == "list_channels" {
         let channels = if let Some(ldk_service) = get_ldk_service() {
             ldk_service.list_channels()
@@ -1318,6 +1494,101 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         return ControlResponse {
             result_type: request.method,
             result: Some(serde_json::to_value(channels).unwrap_or(Value::Array(Vec::new()))),
+            error: None,
+        };
+    }
+
+    if request.method == "list_peers" {
+        let peers = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.list_peers()
+        } else {
+            Vec::new()
+        };
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(serde_json::to_value(peers).unwrap_or(Value::Array(Vec::new()))),
+            error: None,
+        };
+    }
+
+    if request.method == "get_channel" {
+        let params = match serde_json::from_value::<GetChannelParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid get_channel params: {e}"),
+                    )),
+                };
+            }
+        };
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "get_channel".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "ldk service unavailable".to_string(),
+                )),
+            };
+        };
+        return match ldk_service.get_channel(&params.channel_id) {
+            Some(channel) => ControlResponse {
+                result_type: "get_channel".to_string(),
+                result: Some(serde_json::to_value(channel).unwrap_or(Value::Null)),
+                error: None,
+            },
+            None => ControlResponse {
+                result_type: "get_channel".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "NOT_FOUND",
+                    format!("channel not found: {}", params.channel_id),
+                )),
+            },
+        };
+    }
+
+    if request.method == "close_channel" {
+        let params = match serde_json::from_value::<CloseChannelParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid close_channel params: {e}"),
+                    )),
+                };
+            }
+        };
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "close_channel".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "ldk service unavailable".to_string(),
+                )),
+            };
+        };
+        if let Err(e) = ldk_service.close_channel(&params.channel_id, params.force) {
+            return ControlResponse {
+                result_type: "close_channel".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    format!("close_channel failed: {e}"),
+                )),
+            };
+        }
+        return ControlResponse {
+            result_type: "close_channel".to_string(),
+            result: Some(json!({ "status": "accepted", "force": params.force })),
             error: None,
         };
     }

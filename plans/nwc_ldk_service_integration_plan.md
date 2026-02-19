@@ -143,6 +143,24 @@ Run NWC on top of a single live `LdkService` and replace stubbed wallet actions 
 - Integration coverage updated:
   - `control_allowed_when_method_listed_returns_channels_array`
 
+#### Phase 9.5 Status: Done (`open_channel`, `get_channel`, `close_channel`, `list_peers`, `connect_peer`, `disconnect_peer`)
+
+- Added control method wiring for:
+  - `open_channel`
+  - `get_channel`
+  - `close_channel`
+  - `list_peers`
+  - `connect_peer`
+  - `disconnect_peer`
+- Added/updated integration coverage:
+  - `tests/control_open_channel_roundtrip.rs`
+    - `control_open_channel_then_list_channels`
+    - includes `get_channel` and `close_channel` assertions
+  - `tests/control_connect_disconnect_peer_roundtrip.rs`
+    - `control_connect_then_disconnect_peer`
+  - `tests/control_kind_roundtrip.rs`
+    - `control_allowed_list_peers_returns_array`
+
 ## Validation Command
 
 - `cargo test -- --nocapture`

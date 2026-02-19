@@ -247,6 +247,56 @@ async fn control_allowed_when_method_listed_returns_channels_array() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_allowed_list_peers_returns_array() -> Result<()> {
+    let _guard = common::test_guard();
+    let (_relay_container, relay_url, service_pubkey, controller, controller_secret, controller_pubkey) =
+        setup_service_and_controller().await?;
+
+    let owner_keys = Keys::generate();
+    let relay_pubkey = Keys::generate().public_key();
+
+    let mut control = HashMap::new();
+    control.insert("list_peers".to_string(), MethodAccessRule { access_rate: None });
+
+    let profile = UsageProfile {
+        quota: None,
+        methods: None,
+        control: Some(control),
+    };
+    common::grant_usage_profile(
+        &owner_keys,
+        &relay_url,
+        relay_pubkey,
+        controller_pubkey,
+        &profile,
+    )
+    .await?;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let response = send_control_request(
+        &controller,
+        &controller_secret,
+        service_pubkey,
+        json!({
+            "method": "list_peers",
+            "params": {}
+        }),
+    )
+    .await?;
+
+    assert_eq!(response["result_type"], "list_peers");
+    assert!(response["error"].is_null(), "expected no error, got: {:?}", response);
+    assert!(
+        response["result"].is_array(),
+        "expected array result, got: {:?}",
+        response["result"]
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_malformed_payload_returns_other() -> Result<()> {
     let _guard = common::test_guard();
     let (_relay_container, _relay_url, service_pubkey, controller, controller_secret, _controller_pubkey) =
