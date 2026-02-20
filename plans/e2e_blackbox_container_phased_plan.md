@@ -59,6 +59,8 @@ Status: Done (issue #39)
 
 ## Phase 4: Grant + Authorization Black-box
 
+Status: Done (issue #40)
+
 ### Scope
 - Validate grant ingestion and permission enforcement using node-based `d`.
 
