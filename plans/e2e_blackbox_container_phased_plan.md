@@ -97,6 +97,8 @@ Status: Done (issue #41)
 
 ## Phase 6: Full Scenario (Optional, heavier)
 
+Status: In progress (issue #42) — scaffold implemented, reverse-direction payment currently flaky in containerized mode.
+
 ### Scope
 - End-to-end value scenario in containerized black-box setup.
 

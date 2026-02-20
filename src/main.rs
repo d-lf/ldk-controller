@@ -1,12 +1,16 @@
 use nostr_sdk::prelude::*;
 use serde::Deserialize;
 use std::fs;
+use std::sync::Arc;
+
+use ldk_controller::lightning::{LdkService, LdkServiceConfig};
 
 #[derive(Debug, Deserialize)]
 struct Config {
     node: NodeConfig,
     nostr: NostrConfig,
     wallet: WalletConfig,
+    bitcoind: Option<BitcoindConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +31,14 @@ struct WalletConfig {
     max_channel_size_sats: u64,
     min_channel_size_sats: u64,
     auto_accept_channels: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitcoindConfig {
+    rpc_host: String,
+    rpc_port: u16,
+    rpc_user: String,
+    rpc_password: String,
 }
 
 #[tokio::main]
@@ -62,8 +74,26 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Start the NWC service using the shared library code.
-    let client = ldk_controller::run_nwc_service(keys, &config.nostr.relay).await?;
+    // Start NWC service; if bitcoind config is present, attach an LDK backend.
+    let _ldk_service: Option<Arc<LdkService>>;
+    let client = if let Some(bitcoind) = &config.bitcoind {
+        let ldk_cfg = LdkServiceConfig {
+            network: config.node.network.clone(),
+            bitcoind_rpc_host: bitcoind.rpc_host.clone(),
+            bitcoind_rpc_port: bitcoind.rpc_port,
+            bitcoind_rpc_user: bitcoind.rpc_user.clone(),
+            bitcoind_rpc_password: bitcoind.rpc_password.clone(),
+            ldk_storage_dir: config.node.data_dir.clone(),
+            ldk_listen_addr: Some(format!("0.0.0.0:{}", config.node.listening_port)),
+        };
+        let ldk_service =
+            LdkService::start_from_config(&ldk_cfg).expect("Failed to start LDK service");
+        _ldk_service = Some(ldk_service.clone());
+        ldk_controller::run_nwc_service_with_ldk(keys, &config.nostr.relay, ldk_service).await?
+    } else {
+        _ldk_service = None;
+        ldk_controller::run_nwc_service(keys, &config.nostr.relay).await?
+    };
 
     // Keep the main function alive so the background notification handler
     // continues running. Ctrl+C to stop.
