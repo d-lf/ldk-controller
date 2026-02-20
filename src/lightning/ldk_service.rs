@@ -165,6 +165,9 @@ impl LdkService {
 
         let mut builder = Builder::new();
         builder.set_network(network);
+        // Forward LDK-node logs through the Rust `log` facade so runtime logging
+        // configuration (RUST_LOG/env_logger) captures protocol/payment traces.
+        builder.set_log_facade_logger();
         builder.set_chain_source_bitcoind_rpc(
             cfg.bitcoind_rpc_host.clone(),
             cfg.bitcoind_rpc_port,
@@ -456,7 +459,9 @@ impl LdkService {
         &self,
         payment_id: PaymentId,
     ) -> Result<LdkPaymentResult, LdkServiceError> {
-        let timeout = Duration::from_secs(30);
+        // Containerized E2E scenarios can take longer to settle HTLCs due to
+        // startup/sync and cross-container networking overhead.
+        let timeout = Duration::from_secs(60);
         let start = std::time::Instant::now();
         loop {
             if let Some(payment) = self

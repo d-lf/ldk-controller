@@ -545,6 +545,7 @@ const SUPPORTED_METHODS: &[Method] = &[
 ];
 
 const SUPPORTED_CONTROL_METHODS: &[&str] = &[
+    "new_onchain_address",
     "connect_peer",
     "open_channel",
     "close_channel",
@@ -1227,7 +1228,20 @@ async fn process_nwc_request(request: Request, event: &Event) -> Response {
             message: "forced execute failure for testing".to_string(),
         })
     } else {
-        handler.execute(&request, &event.pubkey.to_string())
+        let request_for_exec = request.clone();
+        let caller_pubkey = event.pubkey.to_string();
+        let handler = &**handler;
+        match tokio::task::spawn_blocking(move || {
+            handler.execute(&request_for_exec, &caller_pubkey)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => Err(NIP47Error {
+                code: ErrorCode::Other,
+                message: format!("internal execution task failed: {e}"),
+            }),
+        }
     };
 
     // Execute the request.
@@ -1404,6 +1418,34 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
             result_type: "open_channel".to_string(),
             result: Some(json!({ "status": "accepted" })),
             error: None,
+        };
+    }
+
+    if request.method == "new_onchain_address" {
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "new_onchain_address".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "ldk service unavailable".to_string(),
+                )),
+            };
+        };
+        return match ldk_service.new_onchain_address() {
+            Ok(address) => ControlResponse {
+                result_type: "new_onchain_address".to_string(),
+                result: Some(json!({ "address": address })),
+                error: None,
+            },
+            Err(e) => ControlResponse {
+                result_type: "new_onchain_address".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    format!("new_onchain_address failed: {e}"),
+                )),
+            },
         };
     }
 
