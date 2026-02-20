@@ -11,7 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use common::{start_relay, test_guard};
 use ldk_controller::{MethodAccessRule, UsageProfile};
 use nostr_sdk::prelude::*;
+use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{ErrorCode, Method, NostrWalletConnectUri, Request, Response};
+use serde_json::{json, Value};
 
 struct DockerContainerGuard {
     name: String,
@@ -182,6 +184,44 @@ async fn send_nwc_request_and_wait_response(
     })
     .await
     .expect("timed out waiting for NWC response")
+}
+
+async fn send_control_request_and_wait_response(
+    controller: &Client,
+    controller_secret: &SecretKey,
+    service_pubkey: PublicKey,
+    payload: Value,
+) -> Value {
+    let encrypted = nip04::encrypt(controller_secret, &service_pubkey, payload.to_string())
+        .expect("failed to encrypt control request");
+    let request_event = EventBuilder::new(Kind::Custom(ldk_controller::CONTROL_REQUEST_KIND), encrypted)
+        .tag(Tag::public_key(service_pubkey));
+    controller
+        .send_event_builder(request_event)
+        .await
+        .expect("failed to publish control request event");
+
+    let timeout = Duration::from_secs(15);
+    let response_event = tokio::time::timeout(timeout, async {
+        let mut notifications = controller.notifications();
+        while let Some(notification) = notifications.next().await {
+            if let ClientNotification::Event { event, .. } = notification {
+                let event = event.as_ref();
+                if event.kind == Kind::Custom(ldk_controller::CONTROL_RESPONSE_KIND)
+                    && event.pubkey == service_pubkey
+                {
+                    return event.clone();
+                }
+            }
+        }
+        panic!("notification stream ended before control response");
+    })
+    .await
+    .expect("timed out waiting for control response event");
+
+    let decrypted = nip04::decrypt(controller_secret, &service_pubkey, &response_event.content)
+        .expect("failed to decrypt control response");
+    serde_json::from_str(&decrypted).expect("failed to parse control response JSON")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -431,6 +471,91 @@ async fn e2e_grant_authorization_enforced() -> Result<()> {
     assert!(
         container_running(&controller.name),
         "ldk-controller should still be running after auth checks"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_control_list_channels_roundtrip() -> Result<()> {
+    let _guard = test_guard();
+
+    let _bitcoind = common::bitcoind::BitcoindHarness::start().await;
+    let (_relay_container, relay_url) = start_relay().await;
+    ensure_image_built();
+
+    let service_keys = Keys::generate();
+    let service_secret = service_keys.secret_key().to_bech32()?;
+    let service_pubkey = service_keys.public_key();
+
+    let relay_ws_for_container = relay_url.replace("ws://localhost:", "ws://host.docker.internal:");
+    let config_dir = PathBuf::from(format!("/tmp/{}", unique_id("ldk-controller-config")));
+    write_config(&relay_ws_for_container, &config_dir, &service_secret);
+
+    let controller_container = start_controller_container(&config_dir);
+    wait_for_controller_ready(&controller_container.name);
+
+    let controller_keys = Keys::generate();
+    let controller_secret = controller_keys.secret_key().clone();
+    let controller_pubkey = controller_keys.public_key();
+
+    let mut control = HashMap::new();
+    control.insert(
+        "list_channels".to_string(),
+        MethodAccessRule {
+            access_rate: None,
+        },
+    );
+    let profile = UsageProfile {
+        quota: None,
+        methods: None,
+        control: Some(control),
+    };
+    let owner_keys = Keys::generate();
+    common::grant_usage_profile(
+        &owner_keys,
+        &relay_url,
+        service_pubkey,
+        controller_pubkey,
+        &profile,
+    )
+    .await?;
+
+    let controller_client = Client::builder().signer(controller_keys).build();
+    controller_client.add_relay(&relay_url).await?;
+    controller_client.connect().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    controller_client
+        .subscribe(
+            Filter::new()
+                .kind(Kind::Custom(ldk_controller::CONTROL_RESPONSE_KIND))
+                .author(service_pubkey),
+        )
+        .await?;
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let response = send_control_request_and_wait_response(
+        &controller_client,
+        &controller_secret,
+        service_pubkey,
+        json!({
+            "method": "list_channels",
+            "params": {}
+        }),
+    )
+    .await;
+
+    assert_eq!(response["result_type"], "list_channels");
+    assert!(response["error"].is_null(), "unexpected control error: {:?}", response["error"]);
+    assert!(
+        response["result"].is_array(),
+        "list_channels result should be an array, got: {:?}",
+        response["result"]
+    );
+
+    assert!(
+        container_running(&controller_container.name),
+        "ldk-controller should still be running after control roundtrip"
     );
 
     Ok(())

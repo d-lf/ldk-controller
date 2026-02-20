@@ -78,6 +78,8 @@ Status: Done (issue #40)
 
 ## Phase 5: Control Kind Black-box
 
+Status: Done (issue #41)
+
 ### Scope
 - Validate control-kind routing and at least one real control method in container mode.
 
