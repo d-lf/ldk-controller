@@ -41,14 +41,8 @@ struct BitcoindConfig {
     rpc_password: String,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main]
 async fn main() -> Result<()> {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,ldk_node=debug,lightning=debug"),
-    )
-    .format_timestamp_millis()
-    .try_init();
-
     let contents = fs::read_to_string("config.toml").expect("Failed to read config.toml");
     let config: Config = toml::from_str(&contents).expect("Failed to parse config.toml");
 
