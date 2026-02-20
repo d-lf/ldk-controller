@@ -2,6 +2,8 @@
 
 ## Phase 1: Container Artifact
 
+Status: Done (issue #37)
+
 ### Scope
 - Build `ldk-controller` as a Docker image from `tests/e2e/docker/ldk-controller/Dockerfile`.
 
@@ -16,6 +18,8 @@
 3. No root user in runtime container (verify via image config or `id` in container).
 
 ## Phase 2: Black-box Boot Test (Infrastructure)
+
+Status: Done (issue #38)
 
 ### Scope
 - Prove stack boots: `bitcoind` + `strfry` + `ldk-controller` container.
