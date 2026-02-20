@@ -37,6 +37,8 @@ Status: Done (issue #38)
 
 ## Phase 3: NWC Wallet Black-box Contract
 
+Status: Done (issue #39)
+
 ### Scope
 - Validate public wallet API over Nostr from outside the process.
 

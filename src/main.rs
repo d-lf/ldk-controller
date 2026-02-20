@@ -62,10 +62,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Start the nostr client using the shared library code.
-    // run_client connects to the relay, subscribes to text notes,
-    // and responds "Hi" to any "hello" messages — all in a background task.
-    let client = ldk_controller::run_client(keys, &config.nostr.relay).await?;
+    // Start the NWC service using the shared library code.
+    let client = ldk_controller::run_nwc_service(keys, &config.nostr.relay).await?;
 
     // Keep the main function alive so the background notification handler
     // continues running. Ctrl+C to stop.

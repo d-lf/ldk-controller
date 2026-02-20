@@ -4,9 +4,13 @@ mod common;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{start_relay, test_guard};
+use ldk_controller::UsageProfile;
+use nostr_sdk::prelude::*;
+use nwc::nostr::nips::nip47::{Method, NostrWalletConnectUri, Request, Response};
 
 struct DockerContainerGuard {
     name: String,
@@ -30,33 +34,28 @@ fn unique_id(prefix: &str) -> String {
     )
 }
 
-fn ensure_image_exists() {
-    let inspect = Command::new("docker")
-        .args(["image", "inspect", "ldk-controller:e2e"])
-        .output()
-        .expect("failed to run docker image inspect");
-    if inspect.status.success() {
-        return;
-    }
-
-    let build = Command::new("docker")
-        .args([
-            "build",
-            "-f",
-            "tests/e2e/docker/ldk-controller/Dockerfile",
-            "-t",
-            "ldk-controller:e2e",
-            ".",
-        ])
-        .output()
-        .expect("failed to run docker build for ldk-controller:e2e");
-    if !build.status.success() {
-        let stderr = String::from_utf8_lossy(&build.stderr);
-        panic!("docker build failed for ldk-controller:e2e: {stderr}");
-    }
+fn ensure_image_built() {
+    static IMAGE_BUILT: OnceLock<()> = OnceLock::new();
+    IMAGE_BUILT.get_or_init(|| {
+        let build = Command::new("docker")
+            .args([
+                "build",
+                "-f",
+                "tests/e2e/docker/ldk-controller/Dockerfile",
+                "-t",
+                "ldk-controller:e2e",
+                ".",
+            ])
+            .output()
+            .expect("failed to run docker build for ldk-controller:e2e");
+        if !build.status.success() {
+            let stderr = String::from_utf8_lossy(&build.stderr);
+            panic!("docker build failed for ldk-controller:e2e: {stderr}");
+        }
+    });
 }
 
-fn write_config(relay_url: &str, dir: &PathBuf) {
+fn write_config(relay_url: &str, dir: &PathBuf, private_key: &str) {
     let config = format!(
         r#"[node]
 network = "regtest"
@@ -65,7 +64,7 @@ data_dir = "/var/lib/ldk-controller/data"
 
 [nostr]
 relay = "{relay_url}"
-private_key = "invalid-for-tests"
+private_key = "{private_key}"
 
 [wallet]
 max_channel_size_sats = 1000000
@@ -127,7 +126,7 @@ fn container_running(name: &str) -> bool {
 fn wait_for_controller_ready(name: &str) {
     for _ in 0..40 {
         let logs = container_logs(name);
-        if logs.contains("Subscribed to text notes") {
+        if logs.contains("Press Ctrl+C to stop.") {
             return;
         }
 
@@ -147,6 +146,43 @@ fn wait_for_controller_ready(name: &str) {
     );
 }
 
+async fn send_nwc_request_and_wait_response(
+    nwc_client: &Client,
+    uri: &NostrWalletConnectUri,
+    service_pubkey: PublicKey,
+    method: Method,
+    request: Request,
+) -> Response {
+    let request_event = request
+        .to_event(uri)
+        .expect("failed to create NWC request event");
+    nwc_client
+        .send_event(&request_event)
+        .await
+        .expect("failed to publish NWC request event");
+
+    let timeout = Duration::from_secs(15);
+    let uri_clone = uri.clone();
+    tokio::time::timeout(timeout, async {
+        let mut notifications = nwc_client.notifications();
+        while let Some(notification) = notifications.next().await {
+            if let ClientNotification::Event { event, .. } = notification {
+                let event = event.as_ref();
+                if event.kind == Kind::WalletConnectResponse && event.pubkey == service_pubkey {
+                    let response =
+                        Response::from_event(&uri_clone, event).expect("failed to parse response");
+                    if response.result_type == method {
+                        return response;
+                    }
+                }
+            }
+        }
+        panic!("notification stream ended before NWC response");
+    })
+    .await
+    .expect("timed out waiting for NWC response")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_container_stack_boots() {
     let _guard = test_guard();
@@ -157,11 +193,11 @@ async fn e2e_container_stack_boots() {
 
     let (_relay_container, relay_url) = start_relay().await;
 
-    ensure_image_exists();
+    ensure_image_built();
 
     let relay_ws = relay_url.replace("ws://localhost:", "ws://host.docker.internal:");
     let config_dir = PathBuf::from(format!("/tmp/{}", unique_id("ldk-controller-config")));
-    write_config(&relay_ws, &config_dir);
+    write_config(&relay_ws, &config_dir, "invalid-for-tests");
 
     let controller = start_controller_container(&config_dir);
     wait_for_controller_ready(&controller.name);
@@ -170,4 +206,106 @@ async fn e2e_container_stack_boots() {
         container_running(&controller.name),
         "ldk-controller should still be running after readiness"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_nwc_get_info_get_balance_roundtrip() -> Result<()> {
+    let _guard = test_guard();
+
+    let _bitcoind = common::bitcoind::BitcoindHarness::start().await;
+    let (_relay_container, relay_url) = start_relay().await;
+    ensure_image_built();
+
+    let service_keys = Keys::generate();
+    let service_secret = service_keys.secret_key().to_bech32()?;
+    let service_pubkey = service_keys.public_key();
+
+    let relay_ws_for_container = relay_url.replace("ws://localhost:", "ws://host.docker.internal:");
+    let config_dir = PathBuf::from(format!("/tmp/{}", unique_id("ldk-controller-config")));
+    write_config(&relay_ws_for_container, &config_dir, &service_secret);
+
+    let controller = start_controller_container(&config_dir);
+    wait_for_controller_ready(&controller.name);
+
+    let client_secret = Keys::generate().secret_key().clone();
+    let client_keys = Keys::new(client_secret.clone());
+    let client_pubkey = client_keys.public_key();
+
+    let owner_keys = Keys::generate();
+    let usage_profile = UsageProfile {
+        quota: None,
+        methods: None,
+        control: None,
+    };
+    common::grant_usage_profile(
+        &owner_keys,
+        &relay_url,
+        service_pubkey,
+        client_pubkey,
+        &usage_profile,
+    )
+    .await?;
+
+    let nwc_client = Client::builder().signer(client_keys).build();
+    nwc_client.add_relay(&relay_url).await?;
+    nwc_client.connect().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    nwc_client
+        .subscribe(
+            Filter::new()
+                .kind(Kind::WalletConnectResponse)
+                .author(service_pubkey),
+        )
+        .await?;
+
+    let relay = RelayUrl::parse(&relay_url)?;
+    let uri = NostrWalletConnectUri::new(service_pubkey, vec![relay], client_secret, None);
+
+    let info_response = send_nwc_request_and_wait_response(
+        &nwc_client,
+        &uri,
+        service_pubkey,
+        Method::GetInfo,
+        Request::get_info(),
+    )
+    .await;
+    assert!(
+        info_response.error.is_none(),
+        "get_info returned error: {:?}",
+        info_response.error
+    );
+    let info = info_response
+        .to_get_info()
+        .expect("get_info response should decode");
+    assert_eq!(info.network, Some("regtest".to_string()));
+    assert!(
+        info.pubkey.as_ref().is_some_and(|p| !p.is_empty()),
+        "get_info pubkey should be non-empty"
+    );
+
+    let balance_response = send_nwc_request_and_wait_response(
+        &nwc_client,
+        &uri,
+        service_pubkey,
+        Method::GetBalance,
+        Request::get_balance(),
+    )
+    .await;
+    assert!(
+        balance_response.error.is_none(),
+        "get_balance returned error: {:?}",
+        balance_response.error
+    );
+    let balance = balance_response
+        .to_get_balance()
+        .expect("get_balance response should decode");
+    let _balance_msat = balance.balance;
+
+    assert!(
+        container_running(&controller.name),
+        "ldk-controller should still be running after NWC roundtrip"
+    );
+
+    Ok(())
 }
