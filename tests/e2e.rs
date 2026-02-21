@@ -1,1 +1,2 @@
-// All e2e tests have been moved to dedicated files under tests/.
+#[path = "e2e/deployed_get_info.rs"]
+mod deployed_get_info;
