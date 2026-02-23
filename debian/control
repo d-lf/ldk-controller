@@ -1,0 +1,14 @@
+Source: ldk-controller
+Section: net
+Priority: optional
+Maintainer: René Malmgren <rene@flowrate.dev>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, pkg-config, libssl-dev
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/dukeh3/ldk-controller
+
+Package: ldk-controller
+Architecture: amd64
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: Nostr Wallet Connect controller backed by LDK
+ A Lightning/NWC controller service with access-control and rate-limit support.

@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+# Create declared service user/group in a systemd-native way when available.
+systemd-sysusers /usr/lib/sysusers.d/ldk-controller.sysusers >/dev/null 2>&1 || true
+if ! getent group ldk-controller >/dev/null 2>&1; then
+    addgroup --system ldk-controller
+fi
+if ! getent passwd ldk-controller >/dev/null 2>&1; then
+    adduser --system \
+        --ingroup ldk-controller \
+        --home /var/lib/ldk-controller \
+        --no-create-home \
+        --disabled-login \
+        ldk-controller
+fi
+
+install -d -o ldk-controller -g ldk-controller /var/lib/ldk-controller
+install -d -o ldk-controller -g ldk-controller /var/lib/ldk-controller/data
+install -d -o ldk-controller -g ldk-controller /etc/ldk-controller
+
+chown -R ldk-controller:ldk-controller /var/lib/ldk-controller
+chown -R ldk-controller:ldk-controller /etc/ldk-controller
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl enable ldk-controller.service >/dev/null 2>&1 || true
+
+exit 0

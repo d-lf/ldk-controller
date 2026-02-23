@@ -1,0 +1,20 @@
+[node]
+network = "signet"
+listening_port = 9735
+data_dir = "/var/lib/ldk-controller/data"
+
+[nostr]
+relay = "wss://ldk-cw.flowrate.dev"
+private_key = "REPLACE_WITH_NSEC"
+
+[wallet]
+max_channel_size_sats = 1000000
+min_channel_size_sats = 20000
+auto_accept_channels = false
+
+[bitcoind]
+rpc_host = "127.0.0.1"
+rpc_port = 38332
+rpc_user = "ldkcontroller"
+rpc_password = "REPLACE_WITH_RPC_PASSWORD"
+

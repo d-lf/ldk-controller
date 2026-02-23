@@ -1,0 +1,5 @@
+ldk-controller (0.0.1-1) unstable; urgency=medium
+
+  * Initial Debian packaging skeleton.
+
+ -- René Malmgren <rene@flowrate.dev>  Sun, 22 Feb 2026 21:30:00 +0000

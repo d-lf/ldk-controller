@@ -1,0 +1,17 @@
+[Unit]
+Description=LDK Controller service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ldk-controller
+Group=ldk-controller
+WorkingDirectory=/etc/ldk-controller
+ExecStart=/usr/bin/ldk-controller
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
