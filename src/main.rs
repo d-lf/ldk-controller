@@ -77,6 +77,12 @@ async fn main() -> Result<()> {
     // Start NWC service; if bitcoind config is present, attach an LDK backend.
     let _ldk_service: Option<Arc<LdkService>>;
     let client = if let Some(bitcoind) = &config.bitcoind {
+        // Set bitcoind RPC config for fee estimation
+        ldk_controller::set_bitcoind_rpc(ldk_controller::BitcoindRpc {
+            url: format!("http://{}:{}", bitcoind.rpc_host, bitcoind.rpc_port),
+            user: bitcoind.rpc_user.clone(),
+            password: bitcoind.rpc_password.clone(),
+        });
         let ldk_cfg = LdkServiceConfig {
             network: config.node.network.clone(),
             bitcoind_rpc_host: bitcoind.rpc_host.clone(),

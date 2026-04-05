@@ -1,4 +1,5 @@
 use ldk_node::bitcoin::Network;
+use ldk_node::bitcoin::FeeRate;
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::bitcoin::secp256k1::PublicKey;
@@ -148,6 +149,19 @@ pub struct LdkChannelInfo {
     pub channel_id: String,
     pub counterparty_pubkey: String,
     pub is_channel_ready: bool,
+    pub is_usable: bool,
+    pub is_announced: bool,
+    pub is_outbound: bool,
+    pub capacity: u64,
+    pub local_balance: u64,
+    pub remote_balance: u64,
+    pub base_fee_msat: u32,
+    pub fee_rate_ppm: u32,
+    pub cltv_expiry_delta: u16,
+    pub short_channel_id: Option<u64>,
+    pub confirmations: Option<u32>,
+    pub inbound_htlc_minimum_msat: u64,
+    pub inbound_htlc_maximum_msat: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +170,15 @@ pub struct LdkPeerInfo {
     pub address: String,
     pub is_persisted: bool,
     pub is_connected: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodedInvoiceInfo {
+    pub amount: u64,
+    pub description: String,
+    pub destination: String,
+    pub payment_hash: String,
+    pub expiry: u64,
 }
 
 impl LdkService {
@@ -363,6 +386,90 @@ impl LdkService {
         Ok(())
     }
 
+    pub fn update_channel_fees(
+        &self,
+        channel_id: &str,
+        base_fee_msat: Option<u32>,
+        fee_rate_ppm: Option<u32>,
+    ) -> Result<(), LdkServiceError> {
+        let details = self
+            .node
+            .list_channels()
+            .into_iter()
+            .find(|c| c.channel_id.to_string() == channel_id)
+            .ok_or_else(|| {
+                LdkServiceError::ChannelFailed(format!("channel not found: {channel_id}"))
+            })?;
+
+        let mut config = details.config.clone();
+        if let Some(base) = base_fee_msat {
+            config.forwarding_fee_base_msat = base;
+        }
+        if let Some(rate) = fee_rate_ppm {
+            config.forwarding_fee_proportional_millionths = rate;
+        }
+
+        self.node
+            .update_channel_config(
+                &details.user_channel_id,
+                details.counterparty_node_id,
+                config,
+            )
+            .map_err(|e| LdkServiceError::ChannelFailed(e.to_string()))
+    }
+
+    pub fn send_to_address(
+        &self,
+        address: &str,
+        amount_sats: u64,
+        fee_rate_sat_per_vbyte: Option<u64>,
+    ) -> Result<String, LdkServiceError> {
+        let addr = address
+            .parse::<ldk_node::bitcoin::Address<_>>()
+            .map_err(|e| LdkServiceError::PaymentFailed(format!("invalid address: {e}")))?
+            .assume_checked();
+
+        let fee_rate = fee_rate_sat_per_vbyte.map(|r| FeeRate::from_sat_per_kwu(r * 250));
+
+        let txid = self
+            .node
+            .onchain_payment()
+            .send_to_address(&addr, amount_sats, fee_rate)
+            .map_err(|e| LdkServiceError::PaymentFailed(format!("send_to_address failed: {e}")))?;
+
+        Ok(txid.to_string())
+    }
+
+    pub fn decode_invoice_str(&self, invoice_str: &str) -> Result<DecodedInvoiceInfo, LdkServiceError> {
+        let invoice = Bolt11Invoice::from_str(invoice_str)
+            .map_err(|e| LdkServiceError::InvalidInvoice(e.to_string()))?;
+
+        let amount = invoice.amount_milli_satoshis().unwrap_or(0);
+        let description = invoice.description().to_string();
+        let destination = invoice.payee_pub_key().map(|k| k.to_string())
+            .unwrap_or_else(|| invoice.recover_payee_pub_key().to_string());
+        let payment_hash = invoice.payment_hash().to_string();
+        let expiry = invoice.expiry_time().as_secs();
+
+        Ok(DecodedInvoiceInfo {
+            amount,
+            description,
+            destination,
+            payment_hash,
+            expiry,
+        })
+    }
+
+    pub async fn next_event_async(&self) -> ldk_node::Event {
+        self.node.next_event_async().await
+    }
+
+    pub fn event_handled(&self) -> Result<(), LdkServiceError> {
+        self.node
+            .event_handled()
+            .map_err(|e| LdkServiceError::StopFailed(e.to_string()))
+    }
+
     pub fn stop(&self) -> Result<(), LdkServiceError> {
         self.node
             .stop()
@@ -389,15 +496,34 @@ impl LdkService {
             .any(|c| c.counterparty_node_id == counterparty)
     }
 
+    fn channel_to_info(channel: &ldk_node::ChannelDetails) -> LdkChannelInfo {
+        let local_balance = channel.outbound_capacity_msat / 1000;
+        let remote_balance = channel.inbound_capacity_msat / 1000;
+        LdkChannelInfo {
+            channel_id: channel.channel_id.to_string(),
+            counterparty_pubkey: channel.counterparty_node_id.to_string(),
+            is_channel_ready: channel.is_channel_ready,
+            is_usable: channel.is_usable,
+            is_announced: channel.is_announced,
+            is_outbound: channel.is_outbound,
+            capacity: channel.channel_value_sats,
+            local_balance,
+            remote_balance,
+            base_fee_msat: channel.config.forwarding_fee_base_msat,
+            fee_rate_ppm: channel.config.forwarding_fee_proportional_millionths,
+            cltv_expiry_delta: channel.config.cltv_expiry_delta,
+            short_channel_id: channel.short_channel_id,
+            confirmations: channel.confirmations,
+            inbound_htlc_minimum_msat: channel.inbound_htlc_minimum_msat,
+            inbound_htlc_maximum_msat: channel.inbound_htlc_maximum_msat,
+        }
+    }
+
     pub fn list_channels(&self) -> Vec<LdkChannelInfo> {
         self.node
             .list_channels()
             .iter()
-            .map(|channel| LdkChannelInfo {
-                channel_id: channel.channel_id.to_string(),
-                counterparty_pubkey: channel.counterparty_node_id.to_string(),
-                is_channel_ready: channel.is_channel_ready,
-            })
+            .map(Self::channel_to_info)
             .collect()
     }
 
@@ -406,11 +532,7 @@ impl LdkService {
             .list_channels()
             .iter()
             .find(|channel| channel.channel_id.to_string() == channel_id)
-            .map(|channel| LdkChannelInfo {
-                channel_id: channel.channel_id.to_string(),
-                counterparty_pubkey: channel.counterparty_node_id.to_string(),
-                is_channel_ready: channel.is_channel_ready,
-            })
+            .map(Self::channel_to_info)
     }
 
     pub fn close_channel(&self, channel_id: &str, force: bool) -> Result<(), LdkServiceError> {

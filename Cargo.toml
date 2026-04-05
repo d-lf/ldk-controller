@@ -11,6 +11,7 @@ nostr-sdk = { git = "https://github.com/dukeh3/nostr" }
 nwc = { git = "https://github.com/dukeh3/nostr" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ldk-node = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 
 [dev-dependencies]
 testcontainers = "0.27"

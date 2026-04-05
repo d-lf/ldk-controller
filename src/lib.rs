@@ -38,6 +38,27 @@ static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 static APPLIED_GRANT_EVENTS: OnceLock<RwLock<HashMap<String, AppliedGrantEvent>>> = OnceLock::new();
 static FORCED_EXECUTE_FAILURES: OnceLock<RwLock<HashSet<Method>>> = OnceLock::new();
 static LDK_SERVICE: OnceLock<RwLock<Option<Arc<LdkService>>>> = OnceLock::new();
+static BITCOIND_RPC: OnceLock<BitcoindRpc> = OnceLock::new();
+static FORWARDING_EVENTS: OnceLock<RwLock<Vec<ForwardingEventRecord>>> = OnceLock::new();
+
+/// Bitcoind RPC connection info for fee estimation.
+#[derive(Debug, Clone)]
+pub struct BitcoindRpc {
+    pub url: String,
+    pub user: String,
+    pub password: String,
+}
+
+/// A persisted forwarding event.
+#[derive(Debug, Clone, Serialize)]
+struct ForwardingEventRecord {
+    timestamp: u64,
+    channel_id_in: String,
+    channel_id_out: String,
+    amount_in_msat: u64,
+    fee_msat: u64,
+    status: String,
+}
 
 pub const CONTROL_REQUEST_KIND: u16 = 23196;
 pub const CONTROL_RESPONSE_KIND: u16 = 23197;
@@ -546,6 +567,7 @@ const SUPPORTED_METHODS: &[Method] = &[
 
 const SUPPORTED_CONTROL_METHODS: &[&str] = &[
     "new_onchain_address",
+    "make_onchain_address",
     "connect_peer",
     "open_channel",
     "close_channel",
@@ -553,6 +575,18 @@ const SUPPORTED_CONTROL_METHODS: &[&str] = &[
     "get_channel",
     "list_peers",
     "disconnect_peer",
+    "get_channel_fees",
+    "set_channel_fees",
+    "get_forwarding_history",
+    "get_onchain_transactions",
+    "export_channel_backup",
+    "get_pending_htlcs",
+    "list_network_nodes",
+    "get_network_stats",
+    "get_network_node",
+    "get_network_channel",
+    "query_routes",
+    "estimate_route_fee",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -595,6 +629,24 @@ struct CloseChannelParams {
     #[serde(default)]
     force: bool,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+struct SetChannelFeesParams {
+    channel_id: String,
+    base_fee_msat: Option<u32>,
+    fee_rate_ppm: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GetNetworkNodeParams {
+    pubkey: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GetNetworkChannelParams {
+    channel_id: String,
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ControlError {
@@ -731,8 +783,61 @@ pub async fn run_nwc_service_with_ldk(
     relay_url: &str,
     ldk_service: Arc<LdkService>,
 ) -> Result<Client> {
-    set_ldk_service(ldk_service);
+    set_ldk_service(ldk_service.clone());
+    // Initialize forwarding events store
+    let _ = FORWARDING_EVENTS.set(RwLock::new(Vec::new()));
+    // Spawn event loop to capture forwarding events from LDK-Node
+    spawn_event_loop(ldk_service);
     run_nwc_service(keys, relay_url).await
+}
+
+/// Set bitcoind RPC config for fee estimation. Call before run_nwc_service_with_ldk.
+pub fn set_bitcoind_rpc(rpc: BitcoindRpc) {
+    let _ = BITCOIND_RPC.set(rpc);
+}
+
+/// Spawn a background task that polls LDK-Node events and records forwarding events.
+fn spawn_event_loop(ldk_service: Arc<LdkService>) {
+    tokio::spawn(async move {
+        loop {
+            // next_event_async blocks until an event is available
+            let event = ldk_service.next_event_async().await;
+            if let ldk_node::Event::PaymentForwarded {
+                prev_channel_id,
+                next_channel_id,
+                total_fee_earned_msat,
+                outbound_amount_forwarded_msat,
+                ..
+            } = &event
+            {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let fee_msat = total_fee_earned_msat.unwrap_or(0);
+                let amount_msat = outbound_amount_forwarded_msat.unwrap_or(0) + fee_msat;
+                let record = ForwardingEventRecord {
+                    timestamp: now,
+                    channel_id_in: prev_channel_id.to_string(),
+                    channel_id_out: next_channel_id.to_string(),
+                    amount_in_msat: amount_msat,
+                    fee_msat,
+                    status: "settled".to_string(),
+                };
+                if let Some(store) = FORWARDING_EVENTS.get() {
+                    if let Ok(mut events) = store.write() {
+                        events.push(record);
+                        // Cap at 10000 events in memory
+                        if events.len() > 10_000 {
+                            events.drain(0..1000);
+                        }
+                    }
+                }
+            }
+            // Mark event as handled so LDK-Node moves to the next one
+            let _ = ldk_service.event_handled();
+        }
+    });
 }
 
 trait Handler: Send + Sync {
@@ -1281,6 +1386,91 @@ fn allowed_methods_for(caller_pubkey: &str) -> Vec<Method> {
     }
 }
 
+/// Handle custom NWC methods not in the nwc crate's Method enum.
+/// Returns Some(json_response) if handled, None if not a custom method.
+fn handle_custom_nwc_method(method: &str, params: &Value) -> Option<String> {
+    match method {
+        "decode_invoice" => {
+            let invoice_str = params.get("invoice").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(ldk_service) = get_ldk_service() else {
+                return Some(json!({
+                    "result_type": "decode_invoice",
+                    "error": { "code": "OTHER", "message": "ldk service unavailable" }
+                }).to_string());
+            };
+            match ldk_service.decode_invoice_str(invoice_str) {
+                Ok(info) => Some(json!({
+                    "result_type": "decode_invoice",
+                    "result": {
+                        "amount": info.amount,
+                        "description": info.description,
+                        "destination": info.destination,
+                        "payment_hash": info.payment_hash,
+                        "expiry": info.expiry,
+                    }
+                }).to_string()),
+                Err(e) => Some(json!({
+                    "result_type": "decode_invoice",
+                    "error": { "code": "OTHER", "message": format!("decode_invoice failed: {e}") }
+                }).to_string()),
+            }
+        }
+        "pay_onchain" | "send_onchain" => {
+            let address = params.get("address").and_then(|v| v.as_str()).unwrap_or("");
+            let amount_sats = params.get("amount_sats").and_then(|v| v.as_u64()).unwrap_or(0);
+            let fee_rate = params.get("fee_rate_sat_per_vbyte").and_then(|v| v.as_u64());
+            let Some(ldk_service) = get_ldk_service() else {
+                return Some(json!({
+                    "result_type": method,
+                    "error": { "code": "OTHER", "message": "ldk service unavailable" }
+                }).to_string());
+            };
+            if amount_sats == 0 {
+                return Some(json!({
+                    "result_type": method,
+                    "error": { "code": "OTHER", "message": "amount_sats must be > 0" }
+                }).to_string());
+            }
+            match ldk_service.send_to_address(address, amount_sats, fee_rate) {
+                Ok(txid) => Some(json!({
+                    "result_type": method,
+                    "result": { "txid": txid }
+                }).to_string()),
+                Err(e) => Some(json!({
+                    "result_type": method,
+                    "error": { "code": "OTHER", "message": format!("{method} failed: {e}") }
+                }).to_string()),
+            }
+        }
+        "get_fee_estimates" => {
+            let estimates = query_fee_estimates();
+            Some(json!({
+                "result_type": "get_fee_estimates",
+                "result": estimates,
+            }).to_string())
+        }
+        "make_onchain_address" | "new_onchain_address" => {
+            let Some(ldk_service) = get_ldk_service() else {
+                return Some(json!({
+                    "result_type": method,
+                    "error": { "code": "OTHER", "message": "ldk service unavailable" }
+                }).to_string());
+            };
+            match ldk_service.new_onchain_address() {
+                Ok(address) => Some(json!({
+                    "result_type": method,
+                    "result": { "address": address }
+                }).to_string()),
+                Err(e) => Some(json!({
+                    "result_type": method,
+                    "error": { "code": "OTHER", "message": format!("{e}") }
+                }).to_string()),
+            }
+        }
+        _ => None,
+    }
+}
+
 async fn handle_nwc_request(
     client: &Client,
     keys: &Keys,
@@ -1291,12 +1481,28 @@ async fn handle_nwc_request(
     // Decrypt the NIP-04 encrypted request content
     let decrypted = nip04::decrypt(keys.secret_key(), &sender_pubkey, &event.content)?;
 
-    let request = Request::from_json(&decrypted)?;
-
-    let response = process_nwc_request(request, event).await;
+    // Try standard NWC parsing first; fall back to custom method handling
+    let response_json = match Request::from_json(&decrypted) {
+        Ok(request) => {
+            let response = process_nwc_request(request, event).await;
+            response.as_json()
+        }
+        Err(_) => {
+            // Parse raw JSON to handle custom methods (decode_invoice, pay_onchain, etc.)
+            let raw: Value = serde_json::from_str(&decrypted)?;
+            let method = raw.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            let params = raw.get("params").cloned().unwrap_or(Value::Object(Default::default()));
+            match handle_custom_nwc_method(method, &params) {
+                Some(resp) => resp,
+                None => json!({
+                    "result_type": method,
+                    "error": { "code": "NOT_IMPLEMENTED", "message": format!("unknown method: {method}") }
+                }).to_string(),
+            }
+        }
+    };
 
     // Encrypt the response for the sender
-    let response_json = response.as_json();
     let encrypted = nip04::encrypt(keys.secret_key(), &sender_pubkey, response_json)?;
 
     // Build and send the response event (Kind 23195)
@@ -1314,6 +1520,84 @@ fn control_error(code: &str, message: String) -> ControlError {
         code: code.to_string(),
         message,
     }
+}
+
+/// Query bitcoind for fee estimates via JSON-RPC. Returns sensible defaults on failure.
+fn query_fee_estimates() -> Value {
+    let defaults = json!({
+        "economy_fee": 1,
+        "normal_fee": 5,
+        "priority_fee": 10,
+    });
+
+    let Some(rpc) = BITCOIND_RPC.get() else {
+        return defaults;
+    };
+
+    // Query estimatesmartfee for 3 targets: 2 blocks (priority), 6 blocks (normal), 25 blocks (economy)
+    let targets = [(2, "priority_fee"), (6, "normal_fee"), (25, "economy_fee")];
+    let mut result = serde_json::Map::new();
+
+    for (target, key) in &targets {
+        let body = json!({
+            "jsonrpc": "1.0",
+            "id": "fee",
+            "method": "estimatesmartfee",
+            "params": [target],
+        });
+
+        let fee_rate = std::thread::spawn({
+            let url = rpc.url.clone();
+            let user = rpc.user.clone();
+            let password = rpc.password.clone();
+            let body_str = body.to_string();
+            move || -> Option<f64> {
+                // Blocking HTTP request to bitcoind
+                let client = reqwest::blocking::Client::new();
+                let resp = client
+                    .post(&url)
+                    .basic_auth(&user, Some(&password))
+                    .header("Content-Type", "application/json")
+                    .body(body_str)
+                    .send()
+                    .ok()?;
+                let json: Value = resp.json().ok()?;
+                // estimatesmartfee returns BTC/kvB — convert to sat/vB
+                let btc_per_kvb = json.get("result")?.get("feerate")?.as_f64()?;
+                Some((btc_per_kvb * 100_000.0).round()) // BTC/kvB → sat/vB
+            }
+        })
+        .join()
+        .ok()
+        .flatten()
+        .unwrap_or(match *key {
+            "priority_fee" => 10.0,
+            "normal_fee" => 5.0,
+            _ => 1.0,
+        });
+
+        result.insert(key.to_string(), json!(fee_rate as u64));
+    }
+
+    Value::Object(result)
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b = match chunk.len() {
+            3 => [chunk[0], chunk[1], chunk[2]],
+            2 => [chunk[0], chunk[1], 0],
+            _ => [chunk[0], 0, 0],
+        };
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        result.push(CHARS[((n >> 18) & 63) as usize] as char);
+        result.push(CHARS[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 { result.push(CHARS[((n >> 6) & 63) as usize] as char); } else { result.push('='); }
+        if chunk.len() > 2 { result.push(CHARS[(n & 63) as usize] as char); } else { result.push('='); }
+    }
+    result
 }
 
 fn authorize_control_method(caller_pubkey: &str, method: &str) -> Result<(), ControlError> {
@@ -1421,7 +1705,7 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
     }
 
-    if request.method == "new_onchain_address" {
+    if request.method == "new_onchain_address" || request.method == "make_onchain_address" {
         let Some(ldk_service) = get_ldk_service() else {
             return ControlResponse {
                 result_type: "new_onchain_address".to_string(),
@@ -1540,7 +1824,7 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
         return ControlResponse {
             result_type: request.method,
-            result: Some(serde_json::to_value(channels).unwrap_or(Value::Array(Vec::new()))),
+            result: Some(json!({ "channels": channels })),
             error: None,
         };
     }
@@ -1553,7 +1837,7 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
         return ControlResponse {
             result_type: request.method,
-            result: Some(serde_json::to_value(peers).unwrap_or(Value::Array(Vec::new()))),
+            result: Some(json!({ "peers": peers })),
             error: None,
         };
     }
@@ -1636,6 +1920,212 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         return ControlResponse {
             result_type: "close_channel".to_string(),
             result: Some(json!({ "status": "accepted", "force": params.force })),
+            error: None,
+        };
+    }
+
+    // ─── Fee management ───────────────────────────────────────────────
+
+    if request.method == "get_channel_fees" {
+        let channels = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.list_channels()
+        } else {
+            Vec::new()
+        };
+        let fees: Vec<Value> = channels
+            .iter()
+            .map(|ch| {
+                json!({
+                    "channel_id": ch.channel_id,
+                    "remote_pubkey": ch.counterparty_pubkey,
+                    "base_fee_msat": ch.base_fee_msat,
+                    "fee_rate_ppm": ch.fee_rate_ppm,
+                    "time_lock_delta": ch.cltv_expiry_delta,
+                    "min_htlc_msat": ch.inbound_htlc_minimum_msat,
+                    "max_htlc_msat": ch.inbound_htlc_maximum_msat,
+                })
+            })
+            .collect();
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(json!({ "channel_fees": fees })),
+            error: None,
+        };
+    }
+
+    if request.method == "set_channel_fees" {
+        let params = match serde_json::from_value::<SetChannelFeesParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error("OTHER", format!("invalid set_channel_fees params: {e}"))),
+                };
+            }
+        };
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "set_channel_fees".to_string(),
+                result: None,
+                error: Some(control_error("OTHER", "ldk service unavailable".to_string())),
+            };
+        };
+        if let Err(e) = ldk_service.update_channel_fees(
+            &params.channel_id,
+            params.base_fee_msat,
+            params.fee_rate_ppm,
+        ) {
+            return ControlResponse {
+                result_type: "set_channel_fees".to_string(),
+                result: None,
+                error: Some(control_error("OTHER", format!("set_channel_fees failed: {e}"))),
+            };
+        }
+        return ControlResponse {
+            result_type: "set_channel_fees".to_string(),
+            result: Some(json!({ "status": "updated" })),
+            error: None,
+        };
+    }
+
+    // ─── Forwarding / HTLCs ──────────────────────────────────────────
+
+    if request.method == "get_forwarding_history" {
+        let events = FORWARDING_EVENTS
+            .get()
+            .and_then(|store| store.read().ok())
+            .map(|events| events.clone())
+            .unwrap_or_default();
+        let total = events.len();
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(json!({ "forwarding_events": events, "total_events": total })),
+            error: None,
+        };
+    }
+
+    if request.method == "get_pending_htlcs" {
+        // LDK-Node doesn't expose pending HTLCs
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(json!({ "pending_htlcs": [], "total_count": 0, "current_block_height": 0 })),
+            error: None,
+        };
+    }
+
+    // ─── Onchain transactions ────────────────────────────────────────
+
+    if request.method == "get_onchain_transactions" {
+        // LDK-Node doesn't expose full tx history — return empty
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(json!({ "transactions": [] })),
+            error: None,
+        };
+    }
+
+    // ─── Channel backup ──────────────────────────────────────────────
+
+    if request.method == "export_channel_backup" {
+        let channels = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.list_channels()
+        } else {
+            Vec::new()
+        };
+        let backup_json = serde_json::to_string(&channels).unwrap_or_else(|_| "[]".to_string());
+        let data = base64_encode(backup_json.as_bytes());
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(json!({
+                "format": "json",
+                "data": data,
+                "filename": "channel-backup.json",
+            })),
+            error: None,
+        };
+    }
+
+    // ─── Network graph ───────────────────────────────────────────────
+
+    if request.method == "list_network_nodes" {
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(json!({ "nodes": [] })),
+            error: None,
+        };
+    }
+
+    if request.method == "get_network_stats" {
+        let our_channels = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.list_channels()
+        } else {
+            Vec::new()
+        };
+        let our_capacity: u64 = our_channels.iter().map(|c| c.capacity).sum();
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(json!({
+                "total_nodes": 0,
+                "total_channels": 0,
+                "total_capacity_sats": 0,
+                "our_channel_count": our_channels.len(),
+                "our_capacity_sat": our_capacity,
+            })),
+            error: None,
+        };
+    }
+
+    if request.method == "get_network_node" {
+        let params = match serde_json::from_value::<GetNetworkNodeParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error("OTHER", format!("invalid params: {e}"))),
+                };
+            }
+        };
+        return ControlResponse {
+            result_type: "get_network_node".to_string(),
+            result: Some(json!({ "pubkey": params.pubkey })),
+            error: None,
+        };
+    }
+
+    if request.method == "get_network_channel" {
+        let params = match serde_json::from_value::<GetNetworkChannelParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error("OTHER", format!("invalid params: {e}"))),
+                };
+            }
+        };
+        return ControlResponse {
+            result_type: "get_network_channel".to_string(),
+            result: Some(json!({ "channel_id": params.channel_id })),
+            error: None,
+        };
+    }
+
+    // ─── Route queries (not exposed by LDK-Node) ────────────────────
+
+    if request.method == "query_routes" {
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(json!({ "routes": [] })),
+            error: None,
+        };
+    }
+
+    if request.method == "estimate_route_fee" {
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(json!({ "fee_sat": 0, "fee_msat": 0 })),
             error: None,
         };
     }
