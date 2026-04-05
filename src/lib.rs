@@ -2047,10 +2047,14 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
     // ─── Onchain transactions ────────────────────────────────────────
 
     if request.method == "get_onchain_transactions" {
-        // LDK-Node doesn't expose full tx history — return empty
+        let txns = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.list_onchain_transactions()
+        } else {
+            Vec::new()
+        };
         return ControlResponse {
             result_type: request.method,
-            result: Some(json!({ "transactions": [] })),
+            result: Some(json!({ "transactions": txns })),
             error: None,
         };
     }

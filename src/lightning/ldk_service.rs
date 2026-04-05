@@ -4,7 +4,7 @@ use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
-use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
+use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{Builder, Node};
 use serde::Serialize;
 use std::fmt;
@@ -177,6 +177,17 @@ pub struct BalanceInfo {
     pub onchain_balance_sat: u64,
     pub channel_balance_sat: u64,
     pub pending_balance_sat: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OnchainTxInfo {
+    pub txid: String,
+    pub tx_type: String,
+    pub amount_sat: u64,
+    pub fee_sat: Option<u64>,
+    pub confirmed: bool,
+    pub block_height: Option<u32>,
+    pub block_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -474,6 +485,38 @@ impl LdkService {
             payment_hash,
             expiry,
         })
+    }
+
+    pub fn list_onchain_transactions(&self) -> Vec<OnchainTxInfo> {
+        self.node
+            .list_payments()
+            .into_iter()
+            .filter_map(|p| {
+                if let PaymentKind::Onchain { txid, status } = &p.kind {
+                    let (confirmed, block_height, block_time) = match status {
+                        ConfirmationStatus::Confirmed { height, timestamp, .. } => {
+                            (true, Some(*height), Some(*timestamp))
+                        }
+                        ConfirmationStatus::Unconfirmed => (false, None, None),
+                    };
+                    let tx_type = match p.direction {
+                        PaymentDirection::Outbound => "send",
+                        PaymentDirection::Inbound => "receive",
+                    };
+                    Some(OnchainTxInfo {
+                        txid: txid.to_string(),
+                        tx_type: tx_type.to_string(),
+                        amount_sat: p.amount_msat.unwrap_or(0) / 1000,
+                        fee_sat: p.fee_paid_msat.map(|f| f / 1000),
+                        confirmed,
+                        block_height,
+                        block_time,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub async fn next_event_async(&self) -> ldk_node::Event {
