@@ -600,12 +600,16 @@ struct ControlRequest {
 #[derive(Debug, Clone, Deserialize)]
 struct OpenChannelParams {
     pubkey: String,
-    host: String,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default = "default_port")]
     port: u16,
     capacity_sats: u64,
     #[serde(default)]
     push_msat: Option<u64>,
 }
+
+fn default_port() -> u16 { 9735 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ConnectPeerParams {
@@ -1794,7 +1798,25 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
             };
         };
 
-        let address = format!("{}:{}", params.host, params.port);
+        // Use provided host:port, or look up from connected peers
+        let address = if let Some(host) = &params.host {
+            format!("{host}:{}", params.port)
+        } else {
+            // Peer should already be connected — find their address
+            match ldk_service.list_peers().into_iter().find(|p| p.node_id == params.pubkey) {
+                Some(peer) => peer.address,
+                None => {
+                    return ControlResponse {
+                        result_type: "open_channel".to_string(),
+                        result: None,
+                        error: Some(control_error(
+                            "OTHER",
+                            "peer not connected and no host provided".to_string(),
+                        )),
+                    };
+                }
+            }
+        };
         if let Err(e) = ldk_service.open_channel(
             &params.pubkey,
             &address,
