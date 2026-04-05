@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
 pub struct LdkServiceConfig {
@@ -587,6 +587,13 @@ impl LdkService {
     }
 
     pub fn list_lightning_transactions(&self) -> Vec<LightningTxInfo> {
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Pending payments older than 1 hour are stale (expired invoices, abandoned attempts)
+        let stale_cutoff = now.saturating_sub(3600);
+
         self.node
             .list_payments()
             .into_iter()
@@ -619,6 +626,10 @@ impl LdkService {
                     ),
                     PaymentKind::Onchain { .. } => return None,
                 };
+                // Skip stale pending payments (expired invoices, abandoned attempts)
+                if p.status == PaymentStatus::Pending && p.latest_update_timestamp < stale_cutoff {
+                    return None;
+                }
                 let tx_type = match p.direction {
                     PaymentDirection::Outbound => "outgoing",
                     PaymentDirection::Inbound => "incoming",

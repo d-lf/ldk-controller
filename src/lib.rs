@@ -1155,15 +1155,46 @@ impl Handler for ListTransactionsHandler {
         })
     }
 
-    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
         let ldk = get_ldk_service().ok_or_else(|| NIP47Error {
             code: ErrorCode::Other,
             message: "LDK service not initialized".to_string(),
         })?;
 
+        // Extract filter params
+        let (from, until, limit, offset, type_filter) =
+            if let RequestParams::ListTransactions(params) = &req.params {
+                (
+                    params.from.map(|t| t.as_u64()),
+                    params.until.map(|t| t.as_u64()),
+                    params.limit,
+                    params.offset.unwrap_or(0) as usize,
+                    params.transaction_type,
+                )
+            } else {
+                (None, None, None, 0, None)
+            };
+
         let txns = ldk.list_lightning_transactions();
-        let responses: Vec<LookupInvoiceResponse> = txns
+        let mut responses: Vec<LookupInvoiceResponse> = txns
             .into_iter()
+            .filter(|tx| {
+                // Time range filter
+                if let Some(f) = from {
+                    if tx.created_at < f { return false; }
+                }
+                if let Some(u) = until {
+                    if tx.created_at > u { return false; }
+                }
+                // Type filter
+                if let Some(tt) = type_filter {
+                    match tt {
+                        TransactionType::Incoming => if tx.tx_type != "incoming" { return false; },
+                        TransactionType::Outgoing => if tx.tx_type != "outgoing" { return false; },
+                    }
+                }
+                true
+            })
             .map(|tx| {
                 let transaction_type = if tx.tx_type == "incoming" {
                     TransactionType::Incoming
@@ -1196,6 +1227,14 @@ impl Handler for ListTransactionsHandler {
                     metadata: None,
                 }
             })
+            .collect();
+
+        // Sort newest first, then apply offset + limit
+        responses.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let responses: Vec<LookupInvoiceResponse> = responses
+            .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(200) as usize)
             .collect();
 
         Ok(Response {
