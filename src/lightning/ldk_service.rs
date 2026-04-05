@@ -22,6 +22,7 @@ pub struct LdkServiceConfig {
     pub bitcoind_rpc_password: String,
     pub ldk_storage_dir: String,
     pub ldk_listen_addr: Option<String>,
+    pub node_alias: Option<String>,
 }
 
 impl LdkServiceConfig {
@@ -258,6 +259,11 @@ impl LdkService {
             cfg.bitcoind_rpc_password.clone(),
         );
         builder.set_storage_dir_path(cfg.ldk_storage_dir.clone());
+
+        if let Some(alias) = &cfg.node_alias {
+            builder.set_node_alias(alias.clone())
+                .map_err(|e| LdkServiceInitError::BuildFailed(format!("invalid node alias: {e}")))?;
+        }
 
         if let Some(listen_addr) = &cfg.ldk_listen_addr {
             let socket = SocketAddress::from_str(listen_addr).map_err(|_| {
