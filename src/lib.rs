@@ -1156,10 +1156,52 @@ impl Handler for ListTransactionsHandler {
     }
 
     fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let ldk = get_ldk_service().ok_or_else(|| NIP47Error {
+            code: ErrorCode::Other,
+            message: "LDK service not initialized".to_string(),
+        })?;
+
+        let txns = ldk.list_lightning_transactions();
+        let responses: Vec<LookupInvoiceResponse> = txns
+            .into_iter()
+            .map(|tx| {
+                let transaction_type = if tx.tx_type == "incoming" {
+                    TransactionType::Incoming
+                } else {
+                    TransactionType::Outgoing
+                };
+                let state = match tx.status.as_str() {
+                    "settled" => TransactionState::Settled,
+                    "failed" => TransactionState::Failed,
+                    _ => TransactionState::Pending,
+                };
+                let settled_at = if tx.status == "settled" {
+                    Some(Timestamp::from(tx.created_at))
+                } else {
+                    None
+                };
+                LookupInvoiceResponse {
+                    transaction_type: Some(transaction_type),
+                    state: Some(state),
+                    invoice: None,
+                    description: None,
+                    description_hash: None,
+                    preimage: tx.preimage,
+                    payment_hash: tx.payment_hash,
+                    amount: tx.amount_msat,
+                    fees_paid: tx.fee_msat.unwrap_or(0),
+                    created_at: Timestamp::from(tx.created_at),
+                    expires_at: None,
+                    settled_at,
+                    metadata: None,
+                }
+            })
+            .collect();
+
         Ok(Response {
             result_type: Method::ListTransactions,
             error: None,
-            result: Some(ResponseResult::ListTransactions(Vec::new())),
+            result: Some(ResponseResult::ListTransactions(responses)),
         })
     }
 }

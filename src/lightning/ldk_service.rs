@@ -189,6 +189,20 @@ pub struct OnchainTxInfo {
     pub confirmed: bool,
     pub block_height: Option<u32>,
     pub block_time: Option<u64>,
+    pub last_updated: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LightningTxInfo {
+    pub payment_hash: String,
+    pub preimage: Option<String>,
+    pub payment_type: String,
+    pub tx_type: String,
+    pub status: String,
+    pub amount_msat: u64,
+    pub fee_msat: Option<u64>,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -518,8 +532,23 @@ impl LdkService {
     }
 
     pub fn list_onchain_transactions(&self) -> Vec<OnchainTxInfo> {
-        self.node
-            .list_payments()
+        let payments = self.node.list_payments();
+
+        // Collect txids that have outbound payments — inbound entries with
+        // the same txid are change outputs and should be marked "internal".
+        let outbound_txids: std::collections::HashSet<String> = payments
+            .iter()
+            .filter_map(|p| {
+                if let PaymentKind::Onchain { txid, .. } = &p.kind {
+                    if p.direction == PaymentDirection::Outbound {
+                        return Some(txid.to_string());
+                    }
+                }
+                None
+            })
+            .collect();
+
+        payments
             .into_iter()
             .filter_map(|p| {
                 if let PaymentKind::Onchain { txid, status } = &p.kind {
@@ -529,22 +558,86 @@ impl LdkService {
                         }
                         ConfirmationStatus::Unconfirmed => (false, None, None),
                     };
+                    let txid_str = txid.to_string();
                     let tx_type = match p.direction {
                         PaymentDirection::Outbound => "send",
-                        PaymentDirection::Inbound => "receive",
+                        PaymentDirection::Inbound => {
+                            if outbound_txids.contains(&txid_str) {
+                                "internal" // change output from a send
+                            } else {
+                                "receive"
+                            }
+                        }
                     };
                     Some(OnchainTxInfo {
-                        txid: txid.to_string(),
+                        txid: txid_str,
                         tx_type: tx_type.to_string(),
                         amount_sat: p.amount_msat.unwrap_or(0) / 1000,
                         fee_sat: p.fee_paid_msat.map(|f| f / 1000),
                         confirmed,
                         block_height,
                         block_time,
+                        last_updated: p.latest_update_timestamp,
                     })
                 } else {
                     None
                 }
+            })
+            .collect()
+    }
+
+    pub fn list_lightning_transactions(&self) -> Vec<LightningTxInfo> {
+        self.node
+            .list_payments()
+            .into_iter()
+            .filter_map(|p| {
+                let (payment_hash, preimage, payment_type) = match &p.kind {
+                    PaymentKind::Bolt11 { hash, preimage, .. } => (
+                        hash.to_string(),
+                        preimage.map(|i| i.to_string()),
+                        "bolt11",
+                    ),
+                    PaymentKind::Bolt11Jit { hash, preimage, .. } => (
+                        hash.to_string(),
+                        preimage.map(|i| i.to_string()),
+                        "bolt11",
+                    ),
+                    PaymentKind::Spontaneous { hash, preimage, .. } => (
+                        hash.to_string(),
+                        preimage.map(|i| i.to_string()),
+                        "keysend",
+                    ),
+                    PaymentKind::Bolt12Offer { hash, .. } => (
+                        hash.map(|h| h.to_string()).unwrap_or_default(),
+                        None,
+                        "bolt12",
+                    ),
+                    PaymentKind::Bolt12Refund { hash, .. } => (
+                        hash.map(|h| h.to_string()).unwrap_or_default(),
+                        None,
+                        "bolt12",
+                    ),
+                    PaymentKind::Onchain { .. } => return None,
+                };
+                let tx_type = match p.direction {
+                    PaymentDirection::Outbound => "outgoing",
+                    PaymentDirection::Inbound => "incoming",
+                };
+                let status = match p.status {
+                    PaymentStatus::Succeeded => "settled",
+                    PaymentStatus::Pending => "pending",
+                    PaymentStatus::Failed => "failed",
+                };
+                Some(LightningTxInfo {
+                    payment_hash,
+                    preimage,
+                    payment_type: payment_type.to_string(),
+                    tx_type: tx_type.to_string(),
+                    status: status.to_string(),
+                    amount_msat: p.amount_msat.unwrap_or(0),
+                    fee_msat: p.fee_paid_msat,
+                    created_at: p.latest_update_timestamp,
+                })
             })
             .collect()
     }
