@@ -588,11 +588,18 @@ impl LdkService {
                     } else {
                         None
                     };
+                    // Only report fee for outbound txns — inbound fee_paid_msat
+                    // is the total tx fee (paid by sender, not us)
+                    let fee_sat = if p.direction == PaymentDirection::Outbound {
+                        p.fee_paid_msat.map(|f| f / 1000)
+                    } else {
+                        None
+                    };
                     Some(OnchainTxInfo {
                         txid: txid_str,
                         tx_type: tx_type.to_string(),
                         amount_sat: p.amount_msat.unwrap_or(0) / 1000,
-                        fee_sat: p.fee_paid_msat.map(|f| f / 1000),
+                        fee_sat,
                         confirmed,
                         block_height,
                         block_time,
