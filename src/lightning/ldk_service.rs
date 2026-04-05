@@ -11,6 +11,8 @@ use serde::Serialize;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::cmp::Reverse;
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
@@ -234,6 +236,23 @@ pub struct GraphStats {
     pub our_pubkey: String,
     pub our_channel_count: usize,
     pub our_capacity_sat: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteHop {
+    pub pubkey: String,
+    pub channel_id: u64,
+    pub fee_msat: u64,
+    pub cltv_expiry_delta: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FoundRoute {
+    pub hops: Vec<RouteHop>,
+    pub total_fee_msat: u64,
+    pub total_cltv_delta: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -784,6 +803,118 @@ impl LdkService {
             our_channel_count: our_channels.len(),
             our_capacity_sat: our_capacity,
         }
+    }
+
+    /// Find routes from our node to a destination using Dijkstra over the gossip graph.
+    /// Returns up to `max_routes` routes sorted by total fee (lowest first).
+    pub fn find_routes(
+        &self,
+        dest_pubkey: &str,
+        amount_msat: u64,
+        max_routes: usize,
+    ) -> Vec<FoundRoute> {
+        let Ok(dest_pk) = PublicKey::from_str(dest_pubkey) else {
+            return Vec::new();
+        };
+        let dest_node = NodeId::from_pubkey(&dest_pk);
+        let our_pk = self.node.node_id();
+        let our_node = NodeId::from_pubkey(&our_pk);
+
+        if our_node == dest_node {
+            return Vec::new();
+        }
+
+        let graph = self.node.network_graph();
+        let all_channels = graph.list_channels();
+
+        // Build adjacency: node_id → [(neighbor_node_id, scid, fee_base, fee_prop, cltv, capacity)]
+        type Edge = (NodeId, u64, u32, u32, u16, u64); // (next_node, scid, base, prop, cltv, cap)
+        let mut adj: HashMap<NodeId, Vec<Edge>> = HashMap::new();
+
+        for scid in &all_channels {
+            let Some(ch) = graph.channel(*scid) else { continue };
+            let cap = ch.capacity_sats.unwrap_or(0) * 1000; // msat
+            // Direction: node_one → node_two
+            if let Some(upd) = &ch.one_to_two {
+                let max_htlc = upd.htlc_maximum_msat;
+                if amount_msat >= upd.htlc_minimum_msat && amount_msat <= max_htlc {
+                    adj.entry(ch.node_one).or_default().push((
+                        ch.node_two,
+                        *scid,
+                        upd.fees.base_msat,
+                        upd.fees.proportional_millionths,
+                        upd.cltv_expiry_delta,
+                        cap,
+                    ));
+                }
+            }
+            // Direction: node_two → node_one
+            if let Some(upd) = &ch.two_to_one {
+                let max_htlc = upd.htlc_maximum_msat;
+                if amount_msat >= upd.htlc_minimum_msat && amount_msat <= max_htlc {
+                    adj.entry(ch.node_two).or_default().push((
+                        ch.node_one,
+                        *scid,
+                        upd.fees.base_msat,
+                        upd.fees.proportional_millionths,
+                        upd.cltv_expiry_delta,
+                        cap,
+                    ));
+                }
+            }
+        }
+
+        // Dijkstra: find lowest-fee path
+        // State: (cost_msat, node, path)
+        let mut heap: BinaryHeap<Reverse<(u64, NodeId, Vec<(NodeId, u64, u64, u16)>)>> =
+            BinaryHeap::new();
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut found: Vec<FoundRoute> = Vec::new();
+
+        heap.push(Reverse((0, our_node, Vec::new())));
+
+        while let Some(Reverse((cost, node, path))) = heap.pop() {
+            if found.len() >= max_routes {
+                break;
+            }
+            if path.len() > 6 {
+                continue; // Lightning max 20 hops, but keep it practical
+            }
+            if node == dest_node {
+                let hops: Vec<RouteHop> = path
+                    .iter()
+                    .map(|(n, scid, fee, cltv)| RouteHop {
+                        pubkey: hex_string(n.as_slice()),
+                        channel_id: *scid,
+                        fee_msat: *fee,
+                        cltv_expiry_delta: *cltv,
+                    })
+                    .collect();
+                let total_cltv: u32 = hops.iter().map(|h| h.cltv_expiry_delta as u32).sum();
+                found.push(FoundRoute {
+                    hops,
+                    total_fee_msat: cost,
+                    total_cltv_delta: total_cltv,
+                });
+                continue;
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            if let Some(edges) = adj.get(&node) {
+                for (next, scid, base, prop, cltv, _cap) in edges {
+                    if visited.contains(next) {
+                        continue;
+                    }
+                    let hop_fee = *base as u64 + (amount_msat * *prop as u64) / 1_000_000;
+                    let mut new_path = path.clone();
+                    new_path.push((*next, *scid, hop_fee, *cltv));
+                    heap.push(Reverse((cost + hop_fee, *next, new_path)));
+                }
+            }
+        }
+
+        found
     }
 
     pub async fn next_event_async(&self) -> ldk_node::Event {

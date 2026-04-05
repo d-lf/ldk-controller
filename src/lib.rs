@@ -2127,15 +2127,32 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
     // ─── Forwarding / HTLCs ──────────────────────────────────────────
 
     if request.method == "get_forwarding_history" {
-        let events = FORWARDING_EVENTS
+        let params = &request.params;
+        let start_time = params.get("start_time").and_then(|v| v.as_u64());
+        let end_time = params.get("end_time").and_then(|v| v.as_u64());
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+        let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let all_events = FORWARDING_EVENTS
             .get()
             .and_then(|store| store.read().ok())
             .map(|events| events.clone())
             .unwrap_or_default();
-        let total = events.len();
+
+        let filtered: Vec<_> = all_events
+            .into_iter()
+            .filter(|e| {
+                if let Some(s) = start_time { if e.timestamp < s { return false; } }
+                if let Some(u) = end_time { if e.timestamp > u { return false; } }
+                true
+            })
+            .collect();
+        let total = filtered.len();
+        let page: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+
         return ControlResponse {
             result_type: request.method,
-            result: Some(json!({ "forwarding_events": events, "total_events": total })),
+            result: Some(json!({ "forwarding_events": page, "total_events": total })),
             error: None,
         };
     }
@@ -2276,17 +2293,53 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
     // ─── Route queries (not exposed by LDK-Node) ────────────────────
 
     if request.method == "query_routes" {
+        let params = &request.params;
+        let destination = params.get("destination").and_then(|v| v.as_str()).unwrap_or("");
+        let amount_sats = params.get("amount_sats").and_then(|v| v.as_u64()).unwrap_or(0);
+        let num_routes = params.get("num_routes").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+
+        if destination.is_empty() || amount_sats == 0 {
+            return ControlResponse {
+                result_type: request.method,
+                result: None,
+                error: Some(control_error("OTHER", "destination and amount_sats required".to_string())),
+            };
+        }
+        let routes = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.find_routes(destination, amount_sats * 1000, num_routes)
+        } else {
+            Vec::new()
+        };
         return ControlResponse {
             result_type: request.method,
-            result: Some(json!({ "routes": [] })),
+            result: Some(json!({ "routes": routes })),
             error: None,
         };
     }
 
     if request.method == "estimate_route_fee" {
+        let params = &request.params;
+        let destination = params.get("destination").and_then(|v| v.as_str()).unwrap_or("");
+        let amount_sats = params.get("amount_sats").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        if destination.is_empty() || amount_sats == 0 {
+            return ControlResponse {
+                result_type: request.method,
+                result: None,
+                error: Some(control_error("OTHER", "destination and amount_sats required".to_string())),
+            };
+        }
+        let routes = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.find_routes(destination, amount_sats * 1000, 1)
+        } else {
+            Vec::new()
+        };
+        let (fee_msat, fee_sat) = routes.first()
+            .map(|r| (r.total_fee_msat, r.total_fee_msat / 1000))
+            .unwrap_or((0, 0));
         return ControlResponse {
             result_type: request.method,
-            result: Some(json!({ "fee_sat": 0, "fee_msat": 0 })),
+            result: Some(json!({ "fee_sat": fee_sat, "fee_msat": fee_msat })),
             error: None,
         };
     }
