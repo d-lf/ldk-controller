@@ -173,6 +173,13 @@ pub struct LdkPeerInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct BalanceInfo {
+    pub onchain_balance_sat: u64,
+    pub channel_balance_sat: u64,
+    pub pending_balance_sat: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DecodedInvoiceInfo {
     pub amount: u64,
     pub description: String,
@@ -243,6 +250,15 @@ impl LdkService {
         let sats = self.node.list_balances().spendable_onchain_balance_sats;
         sats.checked_mul(1000)
             .ok_or(LdkServiceError::BalanceOverflow { sats })
+    }
+
+    pub fn get_detailed_balance(&self) -> BalanceInfo {
+        let b = self.node.list_balances();
+        BalanceInfo {
+            onchain_balance_sat: b.spendable_onchain_balance_sats,
+            channel_balance_sat: b.total_lightning_balance_sats,
+            pending_balance_sat: b.total_onchain_balance_sats.saturating_sub(b.spendable_onchain_balance_sats),
+        }
     }
 
     pub fn new_onchain_address(&self) -> Result<String, LdkServiceError> {

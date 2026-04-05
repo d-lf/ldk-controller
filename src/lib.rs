@@ -1391,6 +1391,25 @@ fn allowed_methods_for(caller_pubkey: &str) -> Vec<Method> {
 /// Returns Some(json_response) if handled, None if not a custom method.
 fn handle_custom_nwc_method(method: &str, params: &Value) -> Option<String> {
     match method {
+        "get_balance" => {
+            let Some(ldk_service) = get_ldk_service() else {
+                return Some(json!({
+                    "result_type": "get_balance",
+                    "error": { "code": "OTHER", "message": "ldk service unavailable" }
+                }).to_string());
+            };
+            let _ = ldk_service.sync_wallets();
+            let b = ldk_service.get_detailed_balance();
+            Some(json!({
+                "result_type": "get_balance",
+                "result": {
+                    "balance": (b.channel_balance_sat * 1000),
+                    "onchain_balance": b.onchain_balance_sat,
+                    "channel_balance": b.channel_balance_sat,
+                    "pending_balance": b.pending_balance_sat,
+                }
+            }).to_string())
+        }
         "decode_invoice" => {
             let invoice_str = params.get("invoice").and_then(|v| v.as_str()).unwrap_or("");
             let Some(ldk_service) = get_ldk_service() else {
@@ -1485,23 +1504,26 @@ async fn handle_nwc_request(
         Err(_) => (nip04::decrypt(keys.secret_key(), &sender_pubkey, &event.content)?, false),
     };
 
-    // Try standard NWC parsing first; fall back to custom method handling
-    let response_json = match Request::from_json(&decrypted) {
-        Ok(request) => {
-            let response = process_nwc_request(request, event).await;
-            response.as_json()
-        }
-        Err(_) => {
-            // Parse raw JSON to handle custom methods (decode_invoice, pay_onchain, etc.)
-            let raw: Value = serde_json::from_str(&decrypted)?;
-            let method = raw.get("method").and_then(|v| v.as_str()).unwrap_or("");
-            let params = raw.get("params").cloned().unwrap_or(Value::Object(Default::default()));
-            match handle_custom_nwc_method(method, &params) {
-                Some(resp) => resp,
-                None => json!({
-                    "result_type": method,
-                    "error": { "code": "NOT_IMPLEMENTED", "message": format!("unknown method: {method}") }
-                }).to_string(),
+    // Check for custom/enriched methods first (handles both standard methods
+    // that need extra fields like get_balance, and custom methods not in the nwc crate)
+    let raw: Value = serde_json::from_str(&decrypted).unwrap_or(Value::Null);
+    let method_str = raw.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let params = raw.get("params").cloned().unwrap_or(Value::Object(Default::default()));
+
+    let response_json = if let Some(custom_resp) = handle_custom_nwc_method(method_str, &params) {
+        custom_resp
+    } else {
+        // Fall back to standard NWC handler for methods not in custom handler
+        match Request::from_json(&decrypted) {
+            Ok(request) => {
+                let response = process_nwc_request(request, event).await;
+                response.as_json()
+            }
+            Err(_) => {
+                json!({
+                    "result_type": method_str,
+                    "error": { "code": "NOT_IMPLEMENTED", "message": format!("unknown method: {method_str}") }
+                }).to_string()
             }
         }
     };
