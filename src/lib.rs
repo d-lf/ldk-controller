@@ -4,6 +4,7 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use nwc::nostr::nips::nip04;
+use nostr::nips::nip44;
 use nwc::nostr::nips::nip47::{
     CancelHoldInvoiceResponse, ErrorCode, GetBalanceResponse, GetInfoResponse,
     LookupInvoiceResponse, MakeHoldInvoiceResponse, MakeInvoiceResponse, Method, NIP47Error,
@@ -1478,8 +1479,11 @@ async fn handle_nwc_request(
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sender_pubkey = event.pubkey;
 
-    // Decrypt the NIP-04 encrypted request content
-    let decrypted = nip04::decrypt(keys.secret_key(), &sender_pubkey, &event.content)?;
+    // Decrypt: try NIP-44 first (modern), fall back to NIP-04 (legacy)
+    let (decrypted, use_nip44) = match nip44::decrypt(keys.secret_key(), &sender_pubkey, &event.content) {
+        Ok(d) => (d, true),
+        Err(_) => (nip04::decrypt(keys.secret_key(), &sender_pubkey, &event.content)?, false),
+    };
 
     // Try standard NWC parsing first; fall back to custom method handling
     let response_json = match Request::from_json(&decrypted) {
@@ -1502,8 +1506,12 @@ async fn handle_nwc_request(
         }
     };
 
-    // Encrypt the response for the sender
-    let encrypted = nip04::encrypt(keys.secret_key(), &sender_pubkey, response_json)?;
+    // Encrypt response with same NIP version the request used
+    let encrypted = if use_nip44 {
+        nip44::encrypt(keys.secret_key(), &sender_pubkey, response_json, nip44::Version::V2)?
+    } else {
+        nip04::encrypt(keys.secret_key(), &sender_pubkey, response_json)?
+    };
 
     // Build and send the response event (Kind 23195)
     let response_event = EventBuilder::new(Kind::WalletConnectResponse, encrypted)
@@ -2146,7 +2154,12 @@ async fn handle_control_request(
     event: &Event,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sender_pubkey = event.pubkey;
-    let decrypted = nip04::decrypt(keys.secret_key(), &sender_pubkey, &event.content)?;
+
+    // Decrypt: try NIP-44 first (modern), fall back to NIP-04 (legacy)
+    let (decrypted, use_nip44) = match nip44::decrypt(keys.secret_key(), &sender_pubkey, &event.content) {
+        Ok(d) => (d, true),
+        Err(_) => (nip04::decrypt(keys.secret_key(), &sender_pubkey, &event.content)?, false),
+    };
 
     let response = match serde_json::from_str::<ControlRequest>(&decrypted) {
         Ok(request) => process_control_request(request, &sender_pubkey.to_string()),
@@ -2161,7 +2174,11 @@ async fn handle_control_request(
     };
 
     let response_json = serde_json::to_string(&response)?;
-    let encrypted = nip04::encrypt(keys.secret_key(), &sender_pubkey, response_json)?;
+    let encrypted = if use_nip44 {
+        nip44::encrypt(keys.secret_key(), &sender_pubkey, response_json, nip44::Version::V2)?
+    } else {
+        nip04::encrypt(keys.secret_key(), &sender_pubkey, response_json)?
+    };
     let response_event = EventBuilder::new(Kind::Custom(CONTROL_RESPONSE_KIND), encrypted)
         .tag(Tag::public_key(sender_pubkey))
         .tag(Tag::event(event.id));

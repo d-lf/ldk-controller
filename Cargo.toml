@@ -9,6 +9,7 @@ serde_json = "1"
 toml = "0.8"
 nostr-sdk = { git = "https://github.com/dukeh3/nostr" }
 nwc = { git = "https://github.com/dukeh3/nostr" }
+nostr = { git = "https://github.com/dukeh3/nostr", features = ["nip44"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ldk-node = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }

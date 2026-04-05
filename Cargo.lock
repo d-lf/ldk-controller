@@ -1470,6 +1470,7 @@ name = "ldk-controller"
 version = "0.1.0"
 dependencies = [
  "ldk-node",
+ "nostr",
  "nostr-sdk",
  "nwc",
  "reqwest",
