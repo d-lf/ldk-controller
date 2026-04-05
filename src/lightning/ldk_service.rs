@@ -533,6 +533,13 @@ impl LdkService {
 
     pub fn list_onchain_transactions(&self) -> Vec<OnchainTxInfo> {
         let payments = self.node.list_payments();
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Pending on-chain txns older than 1 hour are stale (ghost UTXOs,
+        // change outputs with broken confirmation tracking)
+        let stale_cutoff = now.saturating_sub(3600);
 
         // Collect txids that have outbound payments — inbound entries with
         // the same txid are change outputs and should be marked "internal".
@@ -558,6 +565,10 @@ impl LdkService {
                         }
                         ConfirmationStatus::Unconfirmed => (false, None, None),
                     };
+                    // Skip stale unconfirmed on-chain entries
+                    if !confirmed && p.latest_update_timestamp < stale_cutoff {
+                        return None;
+                    }
                     let txid_str = txid.to_string();
                     let tx_type = match p.direction {
                         PaymentDirection::Outbound => "send",
