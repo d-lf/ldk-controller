@@ -181,6 +181,7 @@ pub struct BalanceInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OnchainTxInfo {
     pub txid: String,
     pub tx_type: String,
@@ -189,7 +190,7 @@ pub struct OnchainTxInfo {
     pub confirmed: bool,
     pub block_height: Option<u32>,
     pub block_time: Option<u64>,
-    pub last_updated: u64,
+    pub last_updated: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,7 +203,7 @@ pub struct LightningTxInfo {
     pub status: String,
     pub amount_msat: u64,
     pub fee_msat: Option<u64>,
-    pub created_at: u64,
+    pub created_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -580,6 +581,13 @@ impl LdkService {
                             }
                         }
                     };
+                    // Treat timestamp 0 as missing
+                    let block_time = block_time.filter(|&t| t > 0);
+                    let last_updated = if p.latest_update_timestamp > 0 {
+                        Some(p.latest_update_timestamp)
+                    } else {
+                        None
+                    };
                     Some(OnchainTxInfo {
                         txid: txid_str,
                         tx_type: tx_type.to_string(),
@@ -588,7 +596,7 @@ impl LdkService {
                         confirmed,
                         block_height,
                         block_time,
-                        last_updated: p.latest_update_timestamp,
+                        last_updated,
                     })
                 } else {
                     None
@@ -650,6 +658,12 @@ impl LdkService {
                     PaymentStatus::Pending => "pending",
                     PaymentStatus::Failed => "failed",
                 };
+                // Treat timestamp 0 as missing
+                let created_at = if p.latest_update_timestamp > 0 {
+                    Some(p.latest_update_timestamp)
+                } else {
+                    None
+                };
                 Some(LightningTxInfo {
                     payment_hash,
                     preimage,
@@ -658,7 +672,7 @@ impl LdkService {
                     status: status.to_string(),
                     amount_msat: p.amount_msat.unwrap_or(0),
                     fee_msat: p.fee_paid_msat,
-                    created_at: p.latest_update_timestamp,
+                    created_at,
                 })
             })
             .collect()

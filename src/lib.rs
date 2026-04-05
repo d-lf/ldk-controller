@@ -1179,12 +1179,13 @@ impl Handler for ListTransactionsHandler {
         let mut responses: Vec<LookupInvoiceResponse> = txns
             .into_iter()
             .filter(|tx| {
-                // Time range filter
+                // Time range filter (skip txns with no timestamp)
+                let ts = tx.created_at.unwrap_or(0);
                 if let Some(f) = from {
-                    if tx.created_at < f { return false; }
+                    if ts < f { return false; }
                 }
                 if let Some(u) = until {
-                    if tx.created_at > u { return false; }
+                    if ts > u { return false; }
                 }
                 // Type filter
                 if let Some(tt) = type_filter {
@@ -1206,8 +1207,9 @@ impl Handler for ListTransactionsHandler {
                     "failed" => TransactionState::Failed,
                     _ => TransactionState::Pending,
                 };
+                let ts = tx.created_at.map(Timestamp::from).unwrap_or(Timestamp::now());
                 let settled_at = if tx.status == "settled" {
-                    Some(Timestamp::from(tx.created_at))
+                    Some(ts)
                 } else {
                     None
                 };
@@ -1221,7 +1223,7 @@ impl Handler for ListTransactionsHandler {
                     payment_hash: tx.payment_hash,
                     amount: tx.amount_msat,
                     fees_paid: tx.fee_msat.unwrap_or(0),
-                    created_at: Timestamp::from(tx.created_at),
+                    created_at: ts,
                     expires_at: None,
                     settled_at,
                     metadata: None,
