@@ -2083,29 +2083,34 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
     // ─── Network graph ───────────────────────────────────────────────
 
     if request.method == "list_network_nodes" {
+        let nodes = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.list_graph_nodes()
+        } else {
+            Vec::new()
+        };
         return ControlResponse {
             result_type: request.method,
-            result: Some(json!({ "nodes": [] })),
+            result: Some(json!({ "nodes": nodes })),
             error: None,
         };
     }
 
     if request.method == "get_network_stats" {
-        let our_channels = if let Some(ldk_service) = get_ldk_service() {
-            ldk_service.list_channels()
+        let stats = if let Some(ldk_service) = get_ldk_service() {
+            Some(ldk_service.get_graph_stats())
         } else {
-            Vec::new()
+            None
         };
-        let our_capacity: u64 = our_channels.iter().map(|c| c.capacity).sum();
         return ControlResponse {
             result_type: request.method,
-            result: Some(json!({
-                "total_nodes": 0,
-                "total_channels": 0,
-                "total_capacity_sats": 0,
-                "our_channel_count": our_channels.len(),
-                "our_capacity_sat": our_capacity,
-            })),
+            result: Some(serde_json::to_value(stats.unwrap_or_else(|| crate::lightning::GraphStats {
+                total_nodes: 0,
+                total_channels: 0,
+                total_capacity_sats: 0,
+                our_pubkey: String::new(),
+                our_channel_count: 0,
+                our_capacity_sat: 0,
+            })).unwrap_or(json!({}))),
             error: None,
         };
     }
@@ -2121,10 +2126,18 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
                 };
             }
         };
-        return ControlResponse {
-            result_type: "get_network_node".to_string(),
-            result: Some(json!({ "pubkey": params.pubkey })),
-            error: None,
+        let node = get_ldk_service().and_then(|s| s.get_graph_node(&params.pubkey));
+        return match node {
+            Some(n) => ControlResponse {
+                result_type: "get_network_node".to_string(),
+                result: Some(serde_json::to_value(n).unwrap_or(json!({}))),
+                error: None,
+            },
+            None => ControlResponse {
+                result_type: "get_network_node".to_string(),
+                result: Some(json!({ "pubkey": params.pubkey })),
+                error: None,
+            },
         };
     }
 
@@ -2139,10 +2152,19 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
                 };
             }
         };
-        return ControlResponse {
-            result_type: "get_network_channel".to_string(),
-            result: Some(json!({ "channel_id": params.channel_id })),
-            error: None,
+        let scid = params.channel_id.parse::<u64>().unwrap_or(0);
+        let channel = get_ldk_service().and_then(|s| s.get_graph_channel(scid));
+        return match channel {
+            Some(c) => ControlResponse {
+                result_type: "get_network_channel".to_string(),
+                result: Some(serde_json::to_value(c).unwrap_or(json!({}))),
+                error: None,
+            },
+            None => ControlResponse {
+                result_type: "get_network_channel".to_string(),
+                result: Some(json!({ "channel_id": params.channel_id })),
+                error: None,
+            },
         };
     }
 

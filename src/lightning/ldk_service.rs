@@ -4,6 +4,7 @@ use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
+use ldk_node::lightning::routing::gossip::NodeId;
 use ldk_node::payment::{ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{Builder, Node};
 use serde::Serialize;
@@ -188,6 +189,35 @@ pub struct OnchainTxInfo {
     pub confirmed: bool,
     pub block_height: Option<u32>,
     pub block_time: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphNode {
+    pub pubkey: String,
+    pub alias: Option<String>,
+    pub color: Option<String>,
+    pub addresses: Vec<String>,
+    pub last_update: Option<u32>,
+    pub num_channels: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphChannel {
+    pub channel_id: String,
+    pub node1_pubkey: String,
+    pub node2_pubkey: String,
+    pub capacity: u64,
+    pub last_update: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphStats {
+    pub total_nodes: usize,
+    pub total_channels: usize,
+    pub total_capacity_sats: u64,
+    pub our_pubkey: String,
+    pub our_channel_count: usize,
+    pub our_capacity_sat: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -517,6 +547,101 @@ impl LdkService {
                 }
             })
             .collect()
+    }
+
+    pub fn list_graph_nodes(&self) -> Vec<GraphNode> {
+        let graph = self.node.network_graph();
+        let node_ids = graph.list_nodes();
+        node_ids
+            .iter()
+            .filter_map(|node_id| {
+                let info = graph.node(node_id)?;
+                let (alias, color, addresses, last_update) =
+                    if let Some(ann) = &info.announcement_info {
+                        let rgb = ann.rgb();
+                        (
+                            Some(ann.alias().to_string()),
+                            Some(format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])),
+                            ann.addresses().iter().map(|a| a.to_string()).collect(),
+                            Some(ann.last_update()),
+                        )
+                    } else {
+                        (None, None, Vec::new(), None)
+                    };
+                Some(GraphNode {
+                    pubkey: hex_string(node_id.as_slice()),
+                    alias,
+                    color,
+                    addresses,
+                    last_update,
+                    num_channels: info.channels.len(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn get_graph_node(&self, pubkey: &str) -> Option<GraphNode> {
+        let pk = PublicKey::from_str(pubkey).ok()?;
+        let node_id = NodeId::from_pubkey(&pk);
+        let graph = self.node.network_graph();
+        let info = graph.node(&node_id)?;
+        let (alias, color, addresses, last_update) = if let Some(ann) = &info.announcement_info {
+            let rgb = ann.rgb();
+            (
+                Some(ann.alias().to_string()),
+                Some(format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])),
+                ann.addresses().iter().map(|a| a.to_string()).collect(),
+                Some(ann.last_update()),
+            )
+        } else {
+            (None, None, Vec::new(), None)
+        };
+        Some(GraphNode {
+            pubkey: pubkey.to_string(),
+            alias,
+            color,
+            addresses,
+            last_update,
+            num_channels: info.channels.len(),
+        })
+    }
+
+    pub fn get_graph_channel(&self, short_channel_id: u64) -> Option<GraphChannel> {
+        let graph = self.node.network_graph();
+        let info = graph.channel(short_channel_id)?;
+        let last_update = info
+            .one_to_two
+            .as_ref()
+            .map(|u| u.last_update)
+            .or_else(|| info.two_to_one.as_ref().map(|u| u.last_update));
+        Some(GraphChannel {
+            channel_id: short_channel_id.to_string(),
+            node1_pubkey: hex_string(info.node_one.as_slice()),
+            node2_pubkey: hex_string(info.node_two.as_slice()),
+            capacity: info.capacity_sats.unwrap_or(0),
+            last_update,
+        })
+    }
+
+    pub fn get_graph_stats(&self) -> GraphStats {
+        let graph = self.node.network_graph();
+        let channels = graph.list_channels();
+        let nodes = graph.list_nodes();
+        let total_capacity: u64 = channels
+            .iter()
+            .filter_map(|scid| graph.channel(*scid))
+            .filter_map(|c| c.capacity_sats)
+            .sum();
+        let our_channels = self.list_channels();
+        let our_capacity: u64 = our_channels.iter().map(|c| c.capacity).sum();
+        GraphStats {
+            total_nodes: nodes.len(),
+            total_channels: channels.len(),
+            total_capacity_sats: total_capacity,
+            our_pubkey: self.node_id(),
+            our_channel_count: our_channels.len(),
+            our_capacity_sat: our_capacity,
+        }
     }
 
     pub async fn next_event_async(&self) -> ldk_node::Event {
