@@ -262,6 +262,7 @@ pub struct DecodedInvoiceInfo {
     pub destination: String,
     pub payment_hash: String,
     pub expiry: u64,
+    pub expires_at: u64,
 }
 
 impl LdkService {
@@ -547,6 +548,8 @@ impl LdkService {
             .unwrap_or_else(|| invoice.recover_payee_pub_key().to_string());
         let payment_hash = invoice.payment_hash().to_string();
         let expiry = invoice.expiry_time().as_secs();
+        let created_at = invoice.duration_since_epoch().as_secs();
+        let expires_at = created_at + expiry;
 
         Ok(DecodedInvoiceInfo {
             amount,
@@ -554,6 +557,7 @@ impl LdkService {
             destination,
             payment_hash,
             expiry,
+            expires_at,
         })
     }
 

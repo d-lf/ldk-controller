@@ -1513,7 +1513,8 @@ fn handle_custom_nwc_method(method: &str, params: &Value) -> Option<String> {
                         "description": info.description,
                         "destination": info.destination,
                         "payment_hash": info.payment_hash,
-                        "expiry": info.expiry,
+                        "expiry": info.expires_at,
+                        "expires_at": info.expires_at,
                     }
                 }).to_string()),
                 Err(e) => Some(json!({
