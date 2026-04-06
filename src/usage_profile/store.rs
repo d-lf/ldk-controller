@@ -56,3 +56,12 @@ pub(crate) fn upsert_usage_profile(target_pubkey: &str, profile: UsageProfile) {
         .expect("usage profile map lock poisoned");
     map.insert(target_pubkey.to_string(), profile);
 }
+
+/// Returns all pubkeys that have a stored usage profile (i.e., access grants).
+/// Used by the notification publisher to know who to encrypt notifications for.
+pub fn get_all_profile_pubkeys() -> Vec<String> {
+    let map = usage_profiles()
+        .read()
+        .expect("usage profile map lock poisoned");
+    map.keys().cloned().collect()
+}

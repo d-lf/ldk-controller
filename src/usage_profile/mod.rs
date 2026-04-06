@@ -10,7 +10,7 @@ pub(crate) mod store;
 pub(crate) use service::{
     clear_all_usage_profiles_and_states, upsert_usage_profile_and_reset_states,
 };
-pub use store::{clear_usage_profiles, get_usage_profile};
+pub use store::{clear_usage_profiles, get_usage_profile, get_all_profile_pubkeys};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MethodAccessRule {

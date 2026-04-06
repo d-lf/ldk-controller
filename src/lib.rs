@@ -26,6 +26,7 @@ pub use rate_limit_rule::RateLimitRule;
 pub use state::rate_state::RateStateError;
 pub use usage_profile::get_usage_profile;
 pub use usage_profile::{MethodAccessRule, UsageProfile};
+pub use usage_profile::get_all_profile_pubkeys;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessErrorContext {
@@ -63,6 +64,7 @@ struct ForwardingEventRecord {
 
 pub const CONTROL_REQUEST_KIND: u16 = 23196;
 pub const CONTROL_RESPONSE_KIND: u16 = 23197;
+pub const NOTIFICATION_KIND: u16 = 23198;
 
 #[derive(Clone)]
 struct AppliedGrantEvent {
@@ -791,9 +793,10 @@ pub async fn run_nwc_service_with_ldk(
     set_ldk_service(ldk_service.clone());
     // Initialize forwarding events store
     let _ = FORWARDING_EVENTS.set(RwLock::new(Vec::new()));
-    // Spawn event loop to capture forwarding events from LDK-Node
-    spawn_event_loop(ldk_service);
-    run_nwc_service(keys, relay_url).await
+    // Start NWC service first, then spawn event loop with the client for notifications
+    let client = run_nwc_service(keys, relay_url).await?;
+    spawn_event_loop(ldk_service, client.clone());
+    Ok(client)
 }
 
 /// Set bitcoind RPC config for fee estimation. Call before run_nwc_service_with_ldk.
@@ -801,12 +804,15 @@ pub fn set_bitcoind_rpc(rpc: BitcoindRpc) {
     let _ = BITCOIND_RPC.set(rpc);
 }
 
-/// Spawn a background task that polls LDK-Node events and records forwarding events.
-fn spawn_event_loop(ldk_service: Arc<LdkService>) {
+/// Spawn a background task that polls LDK-Node events, records forwarding events,
+/// and publishes kind 23198 notification events to the relay.
+fn spawn_event_loop(ldk_service: Arc<LdkService>, client: Client) {
     tokio::spawn(async move {
         loop {
             // next_event_async blocks until an event is available
             let event = ldk_service.next_event_async().await;
+
+            // ── Record forwarding events in memory ──
             if let ldk_node::Event::PaymentForwarded {
                 prev_channel_id,
                 next_channel_id,
@@ -832,17 +838,168 @@ fn spawn_event_loop(ldk_service: Arc<LdkService>) {
                 if let Some(store) = FORWARDING_EVENTS.get() {
                     if let Ok(mut events) = store.write() {
                         events.push(record);
-                        // Cap at 10000 events in memory
                         if events.len() > 10_000 {
                             events.drain(0..1000);
                         }
                     }
                 }
             }
+
+            // ── Publish kind 23198 notifications ──
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let notification: Option<Value> = match &event {
+                ldk_node::Event::PaymentReceived {
+                    payment_hash,
+                    amount_msat,
+                    ..
+                } => {
+                    println!("[Notification] Payment received: {}... {} sats",
+                        &payment_hash.to_string()[..12], amount_msat / 1000);
+                    Some(json!({
+                        "method": "invoice_settled",
+                        "params": {
+                            "payment_hash": payment_hash.to_string(),
+                            "amount_msat": amount_msat,
+                            "settled_at": now_secs.to_string()
+                        }
+                    }))
+                }
+                ldk_node::Event::PaymentSuccessful {
+                    payment_hash,
+                    fee_paid_msat,
+                    ..
+                } => {
+                    println!("[Notification] Payment sent: {}...",
+                        &payment_hash.to_string()[..12]);
+                    Some(json!({
+                        "method": "payment_sent",
+                        "params": {
+                            "payment_hash": payment_hash.to_string(),
+                            "amount_msat": 0,
+                            "fee_msat": fee_paid_msat.unwrap_or(0)
+                        }
+                    }))
+                }
+                ldk_node::Event::PaymentFailed {
+                    payment_hash,
+                    reason,
+                    ..
+                } => {
+                    println!("[Notification] Payment failed: {:?}", reason);
+                    Some(json!({
+                        "method": "payment_failed",
+                        "params": {
+                            "payment_hash": payment_hash.map(|h| h.to_string()).unwrap_or_default(),
+                            "reason": reason.as_ref().map(|r| format!("{:?}", r)).unwrap_or_else(|| "unknown".to_string())
+                        }
+                    }))
+                }
+                ldk_node::Event::ChannelReady {
+                    channel_id,
+                    counterparty_node_id,
+                    ..
+                } => {
+                    println!("[Notification] Channel opened: {}", channel_id);
+                    Some(json!({
+                        "method": "channel_opened",
+                        "params": {
+                            "channel_id": channel_id.to_string(),
+                            "counterparty_node_id": counterparty_node_id.map(|p| p.to_string()).unwrap_or_default()
+                        }
+                    }))
+                }
+                ldk_node::Event::ChannelClosed {
+                    channel_id,
+                    counterparty_node_id,
+                    reason,
+                    ..
+                } => {
+                    println!("[Notification] Channel closed: {} ({:?})", channel_id, reason);
+                    Some(json!({
+                        "method": "channel_closed",
+                        "params": {
+                            "channel_id": channel_id.to_string(),
+                            "counterparty_node_id": counterparty_node_id.map(|p| p.to_string()).unwrap_or_default(),
+                            "reason": reason.as_ref().map(|r| format!("{:?}", r)).unwrap_or_default()
+                        }
+                    }))
+                }
+                ldk_node::Event::ChannelPending {
+                    channel_id,
+                    counterparty_node_id,
+                    funding_txo,
+                    ..
+                } => {
+                    println!("[Notification] Channel pending: {}", channel_id);
+                    Some(json!({
+                        "method": "channel_pending",
+                        "params": {
+                            "channel_id": channel_id.to_string(),
+                            "counterparty_node_id": counterparty_node_id.to_string(),
+                            "funding_txo": funding_txo.to_string()
+                        }
+                    }))
+                }
+                _ => None,
+            };
+
+            if let Some(payload) = notification {
+                publish_notification_event(&client, &payload.to_string()).await;
+            }
+
             // Mark event as handled so LDK-Node moves to the next one
             let _ = ldk_service.event_handled();
         }
     });
+}
+
+/// Publish a kind 23198 notification to each subscriber with NIP-44 encryption.
+/// Subscriber pubkeys come from access grants (kind 30078) stored in the usage profile map.
+/// Falls back to plaintext if no grants exist.
+async fn publish_notification_event(client: &Client, payload: &str) {
+    let keys = match GLOBAL_KEYS.get() {
+        Some(k) => k,
+        None => return,
+    };
+
+    let subscribers = get_all_profile_pubkeys();
+
+    if subscribers.is_empty() {
+        // No grants — publish plaintext so notifications aren't silently lost
+        let builder = EventBuilder::new(Kind::Custom(NOTIFICATION_KIND), payload)
+            .tag(Tag::public_key(keys.public_key()));
+        if let Err(e) = client.send_event_builder(builder).await {
+            eprintln!("[Notification] publish failed: {e}");
+        }
+        return;
+    }
+
+    for sub_pubkey_hex in &subscribers {
+        let sub_pubkey = match PublicKey::from_hex(sub_pubkey_hex) {
+            Ok(pk) => pk,
+            Err(e) => {
+                eprintln!("[Notification] invalid pubkey {}: {e}", &sub_pubkey_hex[..8]);
+                continue;
+            }
+        };
+
+        match nip44::encrypt(keys.secret_key(), &sub_pubkey, payload, nip44::Version::V2) {
+            Ok(encrypted) => {
+                let builder = EventBuilder::new(Kind::Custom(NOTIFICATION_KIND), encrypted)
+                    .tag(Tag::public_key(sub_pubkey));
+                if let Err(e) = client.send_event_builder(builder).await {
+                    eprintln!("[Notification] publish failed for {}: {e}", &sub_pubkey_hex[..8]);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Notification] encrypt failed for {}: {e}", &sub_pubkey_hex[..8]);
+            }
+        }
+    }
 }
 
 trait Handler: Send + Sync {
