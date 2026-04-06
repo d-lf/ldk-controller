@@ -1077,7 +1077,7 @@ impl Handler for MakeInvoiceHandler {
                     description_hash: params.description_hash.clone(),
                     preimage: None,
                     amount: invoice.amount_msat,
-                    created_at: None,
+                    created_at: Some(Timestamp::now()),
                     expires_at: invoice.expires_at.map(Into::into),
                 })),
             });
