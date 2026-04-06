@@ -1230,7 +1230,7 @@ impl Handler for ListTransactionsHandler {
                     created_at: ts,
                     expires_at: None,
                     settled_at,
-                    metadata: None,
+                    metadata: Some(json!({ "payment_type": tx.payment_type })),
                 }
             })
             .collect();
@@ -1615,6 +1615,9 @@ async fn handle_nwc_request(
             }
         }
     };
+
+    // Debug: log response before encryption
+    eprintln!("[NWC] method={method_str} response_len={} response_json={response_json}", response_json.len());
 
     // Encrypt response with same NIP version the request used
     let encrypted = if use_nip44 {
